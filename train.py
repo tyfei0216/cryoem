@@ -9,8 +9,14 @@ from pytorch_lightning import Trainer
 from pytorch_lightning.callbacks import ModelCheckpoint
 from pytorch_lightning.loggers import TensorBoardLogger
 from torch.utils.data import DataLoader
-from transformers import DetrForObjectDetection, DetrForSegmentation, DetrImageProcessor
+from transformers import (
+    DetrConfig,
+    DetrForObjectDetection,
+    DetrForSegmentation,
+    DetrImageProcessor,
+)
 
+import modules
 import utils
 
 torch.set_float32_matmul_precision("high")
@@ -52,30 +58,29 @@ def run():
 
     print("loading dataset")
     CHECKPOINT = "facebook/detr-resnet-50"
-    image_processor = DetrImageProcessor.from_pretrained(CHECKPOINT)
+    # image_processor = DetrImageProcessor.from_pretrained(CHECKPOINT)
 
-    dataset = utils.CocoDetection(
+    dataset = modules.CocoDetection(
         configs["image_path"],
         configs["annotation_path"],
-        image_processor,
         is_npy=configs["is_npy"],
+        transform=utils.getDefaultTransform(),
+        require_mask=configs["is_segmentation"],
     )  # , transform=transforms)
     train_set, val_set = torch.utils.data.random_split(dataset, [0.8, 0.2])
 
     trainloader = DataLoader(
         dataset=train_set,
-        collate_fn=utils.get_collate_fn(image_processor),
+        collate_fn=utils.stackBatch,
         batch_size=configs["batch_size"],
         shuffle=True,
     )
     valloader = DataLoader(
         dataset=val_set,
-        collate_fn=utils.get_collate_fn(image_processor),
+        collate_fn=utils.stackBatch,
         batch_size=configs["batch_size"],
     )
-    testloader = DataLoader(
-        dataset=val_set, collate_fn=utils.get_collate_fn(image_processor), batch_size=1
-    )
+    testloader = DataLoader(dataset=val_set, collate_fn=utils.stackBatch, batch_size=1)
 
     ds = utils.EMDataModule(trainloader, valloader, testloader)
 
@@ -86,19 +91,35 @@ def run():
     categories = dataset.coco.cats
     id2label = {k: v["name"] for k, v in categories.items()}
 
+    if not config["use_pretrained"]:
+        config["lr_backbone"] = None
+
     if configs["is_segmentation"]:
 
-        pretrain = DetrForSegmentation.from_pretrained(
-            pretrained_model_name_or_path="facebook/detr-resnet-50",
+        config = DetrConfig(
+            use_pretrained_backbone=config["use_pretrained"],
+            num_queries=config["num_queries"],
             num_labels=len(id2label),
-            ignore_mismatched_sizes=True,
         )
+        pretrain = DetrForSegmentation(config)
+
+        # pretrain = DetrForSegmentation.from_pretrained(
+        #     pretrained_model_name_or_path="facebook/detr-resnet-50",
+        #     num_labels=len(id2label),
+        #     ignore_mismatched_sizes=True,
+        # )
     else:
-        pretrain = DetrForObjectDetection.from_pretrained(
-            pretrained_model_name_or_path="facebook/detr-resnet-50",
+        config = DetrConfig(
+            use_pretrained_backbone=config["use_pretrained"],
+            num_queries=config["num_queries"],
             num_labels=len(id2label),
-            ignore_mismatched_sizes=True,
         )
+        pretrain = DetrForObjectDetection(config)
+        # pretrain = DetrForObjectDetection.from_pretrained(
+        #     pretrained_model_name_or_path="facebook/detr-resnet-50",
+        #     num_labels=len(id2label),
+        #     ignore_mismatched_sizes=True,
+        # )
 
     model = utils.Detr(
         lr=configs["lr"],
