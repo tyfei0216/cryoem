@@ -57,18 +57,42 @@ def run():
     L.seed_everything(configs["seed"])
 
     print("loading dataset")
-    CHECKPOINT = "facebook/detr-resnet-50"
+    # CHECKPOINT = "facebook/detr-resnet-50"
     # image_processor = DetrImageProcessor.from_pretrained(CHECKPOINT)
 
-    dataset = modules.CocoDetection(
+    if configs["transform"] == "default":
+        t = utils.getDefaultTransform()
+    else:
+        t = utils.getConstantTransform()
+
+    # dataset = modules.CocoDetection(
+    #     configs["image_path"],
+    #     configs["annotation_path"],
+    #     is_npy=configs["is_npy"],
+    #     transform=t,
+    #     require_mask=configs["is_segmentation"],
+    # )  # , transform=transforms)
+    # train_set, val_set = torch.utils.data.random_split(dataset, [0.8, 0.2])
+    dataset1 = modules.CocoDetection(
         configs["image_path"],
         configs["annotation_path"],
         is_npy=configs["is_npy"],
-        transform=utils.getDefaultTransform(),
+        transform=t,
         require_mask=configs["is_segmentation"],
-    )  # , transform=transforms)
-    train_set, val_set = torch.utils.data.random_split(dataset, [0.8, 0.2])
-
+        filter_class=configs["filter_class"],
+        single_class=configs["single_class"],
+    )
+    dataset2 = modules.CocoDetection(
+        configs["image_path"],
+        configs["annotation_path"],
+        is_npy=configs["is_npy"],
+        transform=utils.getConstantTransform(),
+        require_mask=configs["is_segmentation"],
+        filter_class=configs["filter_class"],
+        single_class=configs["single_class"],
+    )
+    train_set, _val_set = torch.utils.data.random_split(dataset1, [0.8, 0.2])
+    _train_set, val_set = torch.utils.data.random_split(dataset2, [0.8, 0.2])
     trainloader = DataLoader(
         dataset=train_set,
         collate_fn=utils.stackBatch,
@@ -82,37 +106,49 @@ def run():
     )
     testloader = DataLoader(dataset=val_set, collate_fn=utils.stackBatch, batch_size=1)
 
-    ds = utils.EMDataModule(trainloader, valloader, testloader)
+    ds = modules.EMDataModule(trainloader, valloader, testloader)
 
     print("finish loading data")
 
     print("building model")
 
-    categories = dataset.coco.cats
-    id2label = {k: v["name"] for k, v in categories.items()}
+    # categories = dataset.coco.cats
+    # id2label = {k: v["name"] for k, v in categories.items()}
 
-    if not config["use_pretrained"]:
-        config["lr_backbone"] = None
+    if not configs["use_pretrained"]:
+        configs["lr_backbone"] = None
 
     if configs["is_segmentation"]:
 
-        config = DetrConfig(
-            use_pretrained_backbone=config["use_pretrained"],
-            num_queries=config["num_queries"],
-            num_labels=len(id2label),
-        )
-        pretrain = DetrForSegmentation(config)
+        if configs["use_pretrained"] is None:
 
-        # pretrain = DetrForSegmentation.from_pretrained(
-        #     pretrained_model_name_or_path="facebook/detr-resnet-50",
-        #     num_labels=len(id2label),
-        #     ignore_mismatched_sizes=True,
-        # )
+            config = DetrConfig(
+                use_pretrained_backbone=configs["model"],
+                num_queries=configs["num_queries"],
+                num_labels=configs["num_labels"],
+            )
+            pretrain = DetrForSegmentation(config)
+        else:
+            if configs["num_queries"] < 0:
+
+                pretrain = DetrForSegmentation.from_pretrained(
+                    pretrained_model_name_or_path=configs["model"],
+                    num_labels=configs["num_labels"],
+                    ignore_mismatched_sizes=True,
+                )
+            else:
+                pretrain = DetrForSegmentation.from_pretrained(
+                    pretrained_model_name_or_path=configs["model"],
+                    num_queries=configs["num_queries"],
+                    num_labels=configs["num_labels"],
+                    ignore_mismatched_sizes=True,
+                )
+
     else:
         config = DetrConfig(
-            use_pretrained_backbone=config["use_pretrained"],
-            num_queries=config["num_queries"],
-            num_labels=len(id2label),
+            use_pretrained_backbone=configs["use_pretrained"],
+            num_queries=configs["num_queries"],
+            num_labels=configs["num_labels"],
         )
         pretrain = DetrForObjectDetection(config)
         # pretrain = DetrForObjectDetection.from_pretrained(
@@ -121,7 +157,7 @@ def run():
         #     ignore_mismatched_sizes=True,
         # )
 
-    model = utils.Detr(
+    model = modules.Detr(
         lr=configs["lr"],
         lr_backbone=configs["lr_backbone"],
         weight_decay=configs["weight_decay"],
