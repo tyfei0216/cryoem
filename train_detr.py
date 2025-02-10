@@ -2,11 +2,9 @@ import argparse
 import json
 import os
 
-import modules
 import numpy as np
 import pytorch_lightning as L
 import torch
-import utils
 from pytorch_lightning import Trainer
 from pytorch_lightning.callbacks import ModelCheckpoint
 from pytorch_lightning.loggers import TensorBoardLogger
@@ -22,6 +20,9 @@ from transformers import (
     DetrForSegmentation,
     DetrImageProcessor,
 )
+
+import modules
+import utils
 
 torch.set_float32_matmul_precision("high")
 
@@ -77,27 +78,27 @@ def run():
     #     require_mask=configs["is_segmentation"],
     # )  # , transform=transforms)
     # train_set, val_set = torch.utils.data.random_split(dataset, [0.8, 0.2])
-    dataset1 = modules.CocoDetection(
+    train_set = modules.CocoDetection(
         configs["data"]["image_path"],
-        configs["data"]["annotation_path"],
+        configs["data"]["annotation_path_train"],
         is_npy=configs["data"]["is_npy"],
         transform=t,
         require_mask=configs["data"]["require_mask"],
         filter_class=configs["data"]["filter_class"],
         single_class=configs["data"]["single_class"],
     )
-    dataset2 = modules.CocoDetection(
+    val_set = modules.CocoDetection(
         configs["data"]["image_path"],
-        configs["data"]["annotation_path"],
+        configs["data"]["annotation_path_val"],
         is_npy=configs["data"]["is_npy"],
         transform=utils.getConstantTransform(),
         require_mask=configs["data"]["require_mask"],
         filter_class=configs["data"]["filter_class"],
         single_class=configs["data"]["single_class"],
     )
-    train_set, _val_set = torch.utils.data.random_split(dataset1, [0.8, 0.2])
-    _train_set, val_set = torch.utils.data.random_split(dataset2, [0.8, 0.2])
-    val_set.indices = _val_set.indices
+    # train_set, _val_set = torch.utils.data.random_split(dataset1, [0.8, 0.2])
+    # _train_set, val_set = torch.utils.data.random_split(dataset2, [0.8, 0.2])
+    # val_set.indices = _val_set.indices
     trainloader = DataLoader(
         dataset=train_set,
         collate_fn=utils.stackBatch,
@@ -198,6 +199,10 @@ def run():
         model=model,
     )
 
+    if "checkpoint" in configs["model"] and configs["model"]["checkpoint"] is not None:
+        t = torch.load(configs["model"]["checkpoint"], map_location="cpu")
+        model.load_state_dict(t["state_dict"], strict=False)
+
     print("finish build model")
 
     checkpoint_callback = ModelCheckpoint(
@@ -217,12 +222,16 @@ def run():
         max_epochs=configs["training"]["epochs"],
         gradient_clip_val=configs["training"]["gradient_clip_val"],
         accumulate_grad_batches=configs["training"]["accumulate_grad_batches"],
-        log_every_n_steps=1,
+        log_every_n_steps=configs["training"]["log_every_n_steps"],
         callbacks=[checkpoint_callback],
     )
 
     print("start training")
-    trainer.fit(model, ds)
+    if args.checkpoint is not None:
+        trainer.fit(model, ds, ckpt_path=args.checkpoint)
+    else:
+        trainer.fit(model, ds)
+    print("finish training")
 
 
 if __name__ == "__main__":

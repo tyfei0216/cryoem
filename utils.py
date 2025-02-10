@@ -11,7 +11,19 @@ import torch.nn as nn
 import torchvision.datasets
 import torchvision.transforms.v2 as transforms
 from torchvision.tv_tensors import BoundingBoxes, Mask
-from transformers import DetrForObjectDetection
+from transformers import (
+    ConditionalDetrConfig,
+    ConditionalDetrForObjectDetection,
+    ConditionalDetrForSegmentation,
+    DeformableDetrConfig,
+    DeformableDetrForObjectDetection,
+    DetrConfig,
+    DetrForObjectDetection,
+    DetrForSegmentation,
+    DetrImageProcessor,
+)
+
+import modules
 
 
 def getDefaultTransform():
@@ -141,11 +153,16 @@ def stackBatch(batch):
     pixel_values = torch.stack([item["pixel_values"] for item in batch])
     pixel_mask = torch.stack([item["pixel_mask"] for item in batch])
     labels = [item["labels"] for item in batch]
-    return {
+    ret = {
         "pixel_values": pixel_values,
         "pixel_mask": pixel_mask,
         "labels": labels,
+        # "marks": marks,
     }
+    if "mark" in batch[0]:
+        mark = [item["mark"] for item in batch]
+    ret["mark"] = mark
+    return ret
 
 
 def mask_iou(mask1, mask2):
@@ -286,3 +303,80 @@ def toTarget(result, size):
             "bboxes": BoundingBoxes(result["boxes"], format="xyxy", canvas_size=size),
             "names": [str(i.item()) for i in result["labels"]],
         }
+
+
+def buildModel(configs, args, checkpoint=None):
+    if configs["model"]["name"] == "conditional_detr":
+        if configs["model"]["task"] == "segmentation":
+            config = ConditionalDetrConfig(use_pretrained_backbone=False, **args)
+            seg_model = ConditionalDetrForSegmentation(config)
+            if len(configs["model"]["pretrained"]) > 0:
+                model = ConditionalDetrForObjectDetection.from_pretrained(
+                    configs["model"]["pretrained"], ignore_mismatched_sizes=True, **args
+                )
+                seg_model.conditional_detr.load_state_dict(model.state_dict())
+            model = seg_model
+        elif configs["model"]["task"] == "detection":
+            if len(configs["model"]["pretrained"]) > 0:
+                model = ConditionalDetrForObjectDetection.from_pretrained(
+                    configs["model"]["pretrained"], ignore_mismatched_sizes=True, **args
+                )
+            else:
+                config = ConditionalDetrConfig(use_pretrained_backbone=False, **args)
+                model = ConditionalDetrForObjectDetection(config)
+
+    elif configs["model"]["name"] == "deformable_detr":
+        if len(configs["model"]["pretrained"]) > 0:
+            model = DeformableDetrForObjectDetection.from_pretrained(
+                configs["model"]["pretrained"], ignore_mismatched_sizes=True, **args
+            )
+        else:
+            config = DeformableDetrConfig(use_pretrained_backbone=False, **args)
+            model = DeformableDetrForObjectDetection(config)
+
+    elif configs["model"]["name"] == "detr":
+        if configs["model"]["task"] == "segmentation":
+            if len(configs["model"]["pretrained"]) > 0:
+                model = DetrForSegmentation.from_pretrained(
+                    configs["model"]["pretrained"], ignore_mismatched_sizes=True, **args
+                )
+            else:
+                config = DetrConfig(use_pretrained_backbone=False, **args)
+                model = DetrForSegmentation(config)
+        elif configs["model"]["task"] == "detection":
+            if len(configs["model"]["pretrained"]) > 0:
+                model = DetrForObjectDetection.from_pretrained(
+                    configs["model"]["pretrained"], ignore_mismatched_sizes=True, **args
+                )
+            else:
+                config = DetrConfig(use_pretrained_backbone=False, **args)
+                model = DetrForObjectDetection(config)
+    else:
+        raise NotImplementedError
+
+    if checkpoint is not None and len(checkpoint) > 0:
+        model.load_state_dict(torch.load(checkpoint), strict=False)
+
+    return model
+
+
+def getModel(configs):
+    models = {}
+    if "checkpoint" not in configs["model"]:
+        configs["model"]["checkpoint"] = None
+
+    for i in configs["model"]["args"]:
+        models[i] = buildModel(
+            configs, configs["model"]["args"][i], configs["model"]["checkpoint"]
+        )
+
+    model = modules.DetrModel(
+        configs["model"]["stage"],
+        models,
+        lr=configs["training"]["lr"],
+        lr_backbone=configs["training"]["lr_backbone"],
+        weight_decay=configs["training"]["weight_decay"],
+        feature_dim=configs["model"]["feature_dim"],
+        output_dim=configs["model"]["output_dim"],
+    )
+    return model
