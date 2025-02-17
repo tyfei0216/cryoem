@@ -165,6 +165,10 @@ def stackBatch(batch):
     return ret
 
 
+def collect_graph(batch):
+    return batch[0]
+
+
 def mask_iou(mask1, mask2):
     """
     Compute IoU between two binary masks.
@@ -251,6 +255,7 @@ def postSegmentationTreatment(outputs, threshold, target_sizes, mask_threshold=0
 
     prob = nn.functional.softmax(out_logits, -1)
     scores, labels = prob[..., :-1].max(-1)
+    is_nones = prob[..., -1]
 
     boxes = convertBoxes(out_bbox)
     if isinstance(target_sizes, List):
@@ -266,26 +271,39 @@ def postSegmentationTreatment(outputs, threshold, target_sizes, mask_threshold=0
     results = []
 
     if mask_threshold is not None:
-        for s, l, b, mask, size in zip(scores, labels, boxes, masks, target_sizes):
+        for s, l, b, mask, size, is_none in zip(
+            scores, labels, boxes, masks, target_sizes, is_nones
+        ):
             score = s[s > threshold]
             label = l[s > threshold]
             box = b[s > threshold]
             mask = mask[s > threshold]
+            is_none = is_none[s > threshold]
             print(mask.shape, size)
             mask = nn.functional.interpolate(
                 mask[:, None], size=to_tuple(size), mode="bilinear"
             ).squeeze(1)
             mask = mask.sigmoid() > mask_threshold  # * 1
             results.append(
-                {"scores": score, "labels": label, "boxes": box, "masks": mask}
+                {
+                    "scores": score,
+                    "labels": label,
+                    "boxes": box,
+                    "masks": mask,
+                    "is_none": is_none,
+                }
             )
     else:
-        for s, l, b, size in zip(scores, labels, boxes, target_sizes):
+        for s, l, b, size, is_nones in zip(
+            scores, labels, boxes, target_sizes, is_nones
+        ):
             score = s[s > threshold]
             label = l[s > threshold]
             box = b[s > threshold]
-            results.append({"scores": score, "labels": label, "boxes": box})
-
+            is_none = is_nones[s > threshold]
+            results.append(
+                {"scores": score, "labels": label, "boxes": box, "is_none": is_none}
+            )
     return results
 
 
@@ -355,7 +373,22 @@ def buildModel(configs, args, checkpoint=None):
         raise NotImplementedError
 
     if checkpoint is not None and len(checkpoint) > 0:
-        model.load_state_dict(torch.load(checkpoint), strict=False)
+        if checkpoint.endswith(".ckpt"):
+            ckpt = torch.load(checkpoint)["state_dict"]
+        else:
+            ckpt = torch.load(checkpoint)
+        for i, j in model.named_parameters():
+            if i in ckpt and j.shape != ckpt[i].shape:
+                if "query_position_embeddings" not in i:
+                    del ckpt[i]
+                else:
+                    t = j.clone()
+                    t[: min(t.shape[0], ckpt[i].shape[0])] = ckpt[i][
+                        : min(t.shape[0], ckpt[i].shape[0])
+                    ]
+                    # t = torch.randn_like(j)
+                    ckpt[i] = t
+        model.load_state_dict(ckpt, strict=False)
 
     return model
 
@@ -370,11 +403,18 @@ def getModel(configs):
             configs, configs["model"]["args"][i], configs["model"]["checkpoint"]
         )
 
+    if "lr_backbone" not in configs["training"]:
+        configs["training"]["lr_backbone"] = None
+
+    if "lr_detr" not in configs["training"]:
+        configs["training"]["lr_detr"] = None
+
     model = modules.DetrModel(
         configs["model"]["stage"],
         models,
         lr=configs["training"]["lr"],
         lr_backbone=configs["training"]["lr_backbone"],
+        lr_detr=configs["training"]["lr_detr"],
         weight_decay=configs["training"]["weight_decay"],
         feature_dim=configs["model"]["feature_dim"],
         output_dim=configs["model"]["output_dim"],

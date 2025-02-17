@@ -9,18 +9,6 @@ import torch
 from pytorch_lightning import Trainer
 from pytorch_lightning.callbacks import ModelCheckpoint
 from pytorch_lightning.loggers import TensorBoardLogger
-from torch.utils.data import DataLoader
-from transformers import (
-    ConditionalDetrConfig,
-    ConditionalDetrForObjectDetection,
-    ConditionalDetrForSegmentation,
-    DeformableDetrConfig,
-    DeformableDetrForObjectDetection,
-    DetrConfig,
-    DetrForObjectDetection,
-    DetrForSegmentation,
-    DetrImageProcessor,
-)
 
 import modules
 import utils
@@ -66,76 +54,18 @@ def run():
     # CHECKPOINT = "facebook/detr-resnet-50"
     # image_processor = DetrImageProcessor.from_pretrained(CHECKPOINT)
 
-    if configs["data"]["transform"] == "default":
-        t = utils.getDefaultTransform()
-    else:
-        t = utils.getConstantTransform()
+    data_list = []
+    for i in configs["data"]["graphs"]:
+        data_list.append(torch.load(i))
 
-    # dataset = modules.CocoDetection(
-    #     configs["image_path"],
-    #     configs["annotation_path"],
-    #     is_npy=configs["is_npy"],
-    #     transform=t,
-    #     require_mask=configs["is_segmentation"],
-    # )  # , transform=transforms)
-    # train_set, val_set = torch.utils.data.random_split(dataset, [0.8, 0.2])
-    train_sets = {}
-    for i in configs["data"]["filter_class"]:
-        train_sets[i] = modules.CocoDetection(
-            configs["data"]["image_path"],
-            configs["data"]["annotation_path_train"],
-            is_npy=configs["data"]["is_npy"],
-            transform=t,
-            require_mask=configs["data"]["require_mask"][i],
-            filter_class=configs["data"]["filter_class"][i],
-            single_class=configs["data"]["single_class"][i],
-            mark=i,
-        )
-    val_sets = {}
-    for i in configs["data"]["filter_class"]:
-        val_sets[i] = modules.CocoDetection(
-            configs["data"]["image_path"],
-            configs["data"]["annotation_path_val"],
-            is_npy=configs["data"]["is_npy"],
-            transform=utils.getConstantTransform(),
-            require_mask=configs["data"]["require_mask"][i],
-            filter_class=configs["data"]["filter_class"][i],
-            single_class=configs["data"]["single_class"][i],
-            mark=i,
-        )
-
-    # train_set, _val_set = torch.utils.data.random_split(dataset1, [0.8, 0.2])
-    # _train_set, val_set = torch.utils.data.random_split(dataset2, [0.8, 0.2])
-    # val_set.indices = _val_set.indices
-    # trainloader = DataLoader(
-    #     dataset=train_set,
-    #     collate_fn=utils.stackBatch,
-    #     batch_size=configs["training"]["train_batch_size"],
-    #     shuffle=True,
-    # )
-    # valloader = DataLoader(
-    #     dataset=val_set,
-    #     collate_fn=utils.stackBatch,
-    #     batch_size=configs["training"]["val_batch_size"],
-    # )
-    # testloader = DataLoader(dataset=val_set, collate_fn=utils.stackBatch, batch_size=1)
-
-    ds = modules.EMDataModule(
-        train_sets,
-        val_sets,
-        configs["training"]["train_batch_size"],
-        configs["training"]["val_batch_size"],
+    ds = modules.stage2DataModule(
+        data_list,
+        configs["data"]["dataset_len"],
     )
 
     print("finish loading data")
 
     print("building model")
-
-    # categories = dataset.coco.cats
-    # id2label = {k: v["name"] for k, v in categories.items()}
-
-    # if not configs["use_pretrained"]:
-    #     configs["lr_backbone"] = None
 
     model = utils.getModel(configs)
 
@@ -146,12 +76,12 @@ def run():
     print("finish build model")
 
     checkpoint_callback = ModelCheckpoint(
-        monitor="validate_loss",  # Replace with your validation metric
-        mode="min",  # 'min' if the metric should be minimized (e.g., loss), 'max' for maximization (e.g., accuracy)
+        monitor="validate_acc",  # Replace with your validation metric
+        mode="max",  # 'min' if the metric should be minimized (e.g., loss), 'max' for maximization (e.g., accuracy)
         save_top_k=3,  # Save top k checkpoints based on the monitored metric
         save_last=True,  # Save the last checkpoint at the end of training
         dirpath=args.path,  # Directory where the checkpoints will be saved
-        filename="{epoch}-{validate_loss:.2f}",  # Checkpoint file naming pattern
+        filename="{epoch}-{validate_loss:.2f}-{validate_acc:.4f}",  # Checkpoint file naming pattern
     )
     if "gradient_clip_val" not in configs["training"]:
         configs["training"]["gradient_clip_val"] = None
