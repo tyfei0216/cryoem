@@ -78,6 +78,9 @@ def run():
     #     require_mask=configs["is_segmentation"],
     # )  # , transform=transforms)
     # train_set, val_set = torch.utils.data.random_split(dataset, [0.8, 0.2])
+    if "zscore" not in configs["data"]:
+        configs["data"]["zscore"] = False
+
     train_set = modules.CocoDetection(
         configs["data"]["image_path"],
         configs["data"]["annotation_path_train"],
@@ -86,6 +89,7 @@ def run():
         require_mask=configs["data"]["require_mask"],
         filter_class=configs["data"]["filter_class"],
         single_class=configs["data"]["single_class"],
+        zscore=configs["data"]["zscore"],
     )
     val_set = modules.CocoDetection(
         configs["data"]["image_path"],
@@ -95,6 +99,7 @@ def run():
         require_mask=configs["data"]["require_mask"],
         filter_class=configs["data"]["filter_class"],
         single_class=configs["data"]["single_class"],
+        zscore=configs["data"]["zscore"],
     )
     # train_set, _val_set = torch.utils.data.random_split(dataset1, [0.8, 0.2])
     # _train_set, val_set = torch.utils.data.random_split(dataset2, [0.8, 0.2])
@@ -112,7 +117,7 @@ def run():
     )
     testloader = DataLoader(dataset=val_set, collate_fn=utils.stackBatch, batch_size=1)
 
-    ds = modules.EMDataModule(trainloader, valloader, testloader)
+    ds = modules.EMDataModule({"train": train_set}, {"val": val_set}, 2, 4)
 
     print("finish loading data")
 

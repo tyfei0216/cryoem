@@ -66,66 +66,12 @@ def run():
     # CHECKPOINT = "facebook/detr-resnet-50"
     # image_processor = DetrImageProcessor.from_pretrained(CHECKPOINT)
 
-    if configs["data"]["transform"] == "default":
-        t = utils.getDefaultTransform()
-    else:
-        t = utils.getConstantTransform()
-
-    # dataset = modules.CocoDetection(
-    #     configs["image_path"],
-    #     configs["annotation_path"],
-    #     is_npy=configs["is_npy"],
-    #     transform=t,
-    #     require_mask=configs["is_segmentation"],
-    # )  # , transform=transforms)
-    # train_set, val_set = torch.utils.data.random_split(dataset, [0.8, 0.2])
-    train_sets = {}
-    for i in configs["data"]["filter_class"]:
-        train_sets[i] = modules.CocoDetection(
-            configs["data"]["image_path"],
-            configs["data"]["annotation_path_train"],
-            is_npy=configs["data"]["is_npy"],
-            transform=t,
-            require_mask=configs["data"]["require_mask"][i],
-            filter_class=configs["data"]["filter_class"][i],
-            single_class=configs["data"]["single_class"][i],
-            mark=i,
-        )
-    val_sets = {}
-    for i in configs["data"]["filter_class"]:
-        val_sets[i] = modules.CocoDetection(
-            configs["data"]["image_path"],
-            configs["data"]["annotation_path_val"],
-            is_npy=configs["data"]["is_npy"],
-            transform=utils.getConstantTransform(),
-            require_mask=configs["data"]["require_mask"][i],
-            filter_class=configs["data"]["filter_class"][i],
-            single_class=configs["data"]["single_class"][i],
-            mark=i,
-        )
-
-    # train_set, _val_set = torch.utils.data.random_split(dataset1, [0.8, 0.2])
-    # _train_set, val_set = torch.utils.data.random_split(dataset2, [0.8, 0.2])
-    # val_set.indices = _val_set.indices
-    # trainloader = DataLoader(
-    #     dataset=train_set,
-    #     collate_fn=utils.stackBatch,
-    #     batch_size=configs["training"]["train_batch_size"],
-    #     shuffle=True,
-    # )
-    # valloader = DataLoader(
-    #     dataset=val_set,
-    #     collate_fn=utils.stackBatch,
-    #     batch_size=configs["training"]["val_batch_size"],
-    # )
-    # testloader = DataLoader(dataset=val_set, collate_fn=utils.stackBatch, batch_size=1)
-
-    ds = modules.EMDataModule(
-        train_sets,
-        val_sets,
-        configs["training"]["train_batch_size"],
-        configs["training"]["val_batch_size"],
-    )
+    if configs["model"]["stage"] == "stage 1":
+        ds = utils.get_stage1_dataset(configs)
+    elif configs["model"]["stage"] == "stage 2":
+        ds = utils.get_stage2_dataset(configs)
+    elif configs["model"]["stage"] == "stage mask":
+        ds = utils.get_stageMask_dataset(configs)
 
     print("finish loading data")
 
@@ -144,15 +90,50 @@ def run():
     #     model.load_state_dict(t["state_dict"], strict=False)
 
     print("finish build model")
+    monitor = (
+        "total_validate_loss"
+        if configs["model"]["stage"] != "stage 2"
+        else "validate_acc"
+    )
 
+    if configs["model"]["stage"] == "stage mask":
+        monitor = "total_validate_auroc"
+
+    mode = "min" if monitor == "total_validate_loss" else "max"
+
+    filename = (
+        "{epoch}-{total_validate_loss:.4f}"
+        if configs["model"]["stage"] != "stage 2"
+        else "{epoch}-{validate_loss:.4f}-{validate_acc:.4f}"
+    )
+    if configs["model"]["stage"] == "stage mask":
+        filename = "{epoch}-{total_validate_auroc:.4f}"
+
+    # p = os.path.join(args.path, "a.txt")
+    # f = open(p, "w")
+    # a = "abc"
+    # for i in range(20):
+    #     a = a + a
+    # f.write(a)
+    # f.close()
+    print(args.path)
     checkpoint_callback = ModelCheckpoint(
-        monitor="validate_loss",  # Replace with your validation metric
-        mode="min",  # 'min' if the metric should be minimized (e.g., loss), 'max' for maximization (e.g., accuracy)
+        monitor=monitor,  # Replace with your validation metric
+        mode=mode,  # 'min' if the metric should be minimized (e.g., loss), 'max' for maximization (e.g., accuracy)
         save_top_k=3,  # Save top k checkpoints based on the monitored metric
         save_last=True,  # Save the last checkpoint at the end of training
         dirpath=args.path,  # Directory where the checkpoints will be saved
-        filename="{epoch}-{validate_loss:.2f}",  # Checkpoint file naming pattern
+        filename=filename,  # Checkpoint file naming pattern
     )
+
+    checkpoint_callback2 = ModelCheckpoint(
+        every_n_epochs=8,
+        save_top_k=-1,
+        save_last=False,  # Save the last checkpoint at the end of training
+        dirpath=args.path,  # Directory where the checkpoints will be saved
+        filename=filename,  # Checkpoint file naming pattern
+    )
+
     if "gradient_clip_val" not in configs["training"]:
         configs["training"]["gradient_clip_val"] = None
 
@@ -176,7 +157,7 @@ def run():
         gradient_clip_val=configs["training"]["gradient_clip_val"],
         accumulate_grad_batches=configs["training"]["accumulate_grad_batches"],
         log_every_n_steps=configs["training"]["log_every_n_steps"],
-        callbacks=[checkpoint_callback],
+        callbacks=[checkpoint_callback, checkpoint_callback2],
     )
 
     print("start training")
