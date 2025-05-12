@@ -90,7 +90,7 @@ def transformImage(image):
     return image
 
 
-def drawannotation(image, target):
+def drawannotation(image, target, box=True, mask=True):
     import matplotlib.pyplot as plt
     from torchvision.utils import draw_bounding_boxes, draw_segmentation_masks
 
@@ -101,7 +101,7 @@ def drawannotation(image, target):
         image /= torch.max(image)
         image = torch.tensor(image * 255).type(torch.uint8)
 
-    if "masks" in target:
+    if "masks" in target and mask:
         annotated_tensor = draw_segmentation_masks(
             image=image,
             masks=target["masks"],
@@ -113,14 +113,15 @@ def drawannotation(image, target):
         annotated_tensor = torch.tensor(annotated_tensor, dtype=torch.uint8)
     # Annotate the sample image with labels and bounding boxes
     # if "names" in target:
-    annotated_tensor = draw_bounding_boxes(
-        image=annotated_tensor,
-        boxes=target["bboxes"],
-        labels=target["names"] if "names" in target else target["labels"],
-        font_size=30,
-        width=5,
-        # colors=[int_colors[i] for i in [class_names.index(label) for label in labels]]
-    )
+    if box:
+        annotated_tensor = draw_bounding_boxes(
+            image=annotated_tensor,
+            boxes=target["bboxes"],
+            labels=target["names"] if "names" in target else target["labels"],
+            font_size=30,
+            width=5,
+            # colors=[int_colors[i] for i in [class_names.index(label) for label in labels]]
+        )
     res = annotated_tensor.numpy()
     plt.imshow(np.moveaxis(res, 0, -1))
 
@@ -185,6 +186,10 @@ def stackBatch(batch):
     return ret
 
 
+def identicalMapping(batch):
+    return batch
+
+
 def collect_graph(batch):
     return batch[0]
 
@@ -227,8 +232,17 @@ def bbnms(threshold, boxes, scores, classids):
         keep = torchvision.ops.nms(
             boxes[classids == i], scores[classids == i], threshold
         )
-        ids = torch.where(classids == i)[0]
+        if isinstance(classids, torch.Tensor):
+            ids = torch.where(classids == i)[0]
+        else:
+            ids = np.where(classids == i)[0]
+            ids = torch.tensor(ids)
+        if ids.dim() < 1:
+            ids = ids.unsqueeze(0)
+        # if len(keep) >= 1:
+        # allkeep.append(torch.tensor([]))
         allkeep.append(ids[keep])
+    # print(allkeep)
     keep = torch.cat(allkeep)
     return keep
 
@@ -441,13 +455,21 @@ def buildModel(configs, args, checkpoint=None):
 
 
 def getModel(configs):
-    models = {}
+
     if "checkpoint" not in configs["model"]:
         configs["model"]["checkpoint"] = None
 
-    for i in configs["model"]["args"]:
-        models[i] = buildModel(
-            configs, configs["model"]["args"][i], configs["model"]["checkpoint"]
+    if isinstance(configs["data"]["require_mask"], dict):
+
+        models = {}
+
+        for i in configs["model"]["args"]:
+            models[i] = buildModel(
+                configs, configs["model"]["args"][i], configs["model"]["checkpoint"]
+            )
+    else:
+        models = buildModel(
+            configs, configs["model"]["args"], configs["model"]["checkpoint"]
         )
 
     if "lr_backbone" not in configs["training"]:
@@ -465,6 +487,9 @@ def getModel(configs):
     if "scheduler_step" not in configs["training"]:
         configs["training"]["scheduler_step"] = -1
 
+    if "warmup_epoches" not in configs["training"]:
+        configs["training"]["warmup_epoches"] = 0
+
     model = modules.DetrModel(
         configs["model"]["stage"],
         models,
@@ -478,6 +503,7 @@ def getModel(configs):
         layer_type=configs["model"]["layer_type"],
         dropout=configs["model"]["dropout"],
         scheduler_step=configs["training"]["scheduler_step"],
+        warmup_epoches=configs["training"]["warmup_epoches"],
     )
     if "load" in configs["model"] and configs["model"]["load"] is not None:
         t = torch.load(configs["model"]["load"], map_location="cpu")
@@ -505,9 +531,7 @@ matcher = DeformableDetrHungarianMatcher(1.0, 5.0, 2.0)
 matcher
 
 
-def processSingle(
-    model, label, data, target_size, model_names, thres, has_none, single=True
-):
+def processSingle(model, label, data, target_size, thres, has_none, empty=5):
     ret = []
     boxeses = []
     box_masks = []
@@ -518,92 +542,97 @@ def processSingle(
         pixel_values=data["pixel_values"].unsqueeze(0).float(),
         pixel_mask=data["pixel_mask"].unsqueeze(0).float(),
     )
-    for idx, i in enumerate(model_names):
-        # print(i)
-        _output = output[i]
-        logits = _output["logits"].squeeze(0)
-        pred_boxes = _output["pred_boxes"].squeeze(0)
-        if has_none:
-            # print(logits, logits.shape)
-            prob = torch.softmax(logits, -1)
-            prob = prob[:, :-1]
-        else:
-            prob = torch.sigmoid(logits)
-        v, pos = torch.max(prob, dim=1)
+    # for idx, i in enumerate(model_names):
+    #     # print(i)
+    #     if i!="none":
+    #         _output = output[i]
+    #     else:
+    #         _output = output
+    logits = output["logits"].squeeze(0)
+    pred_boxes = output["pred_boxes"].squeeze(0)
+    if has_none:
+        # print(logits, logits.shape)
+        prob = torch.softmax(logits, -1)
+        prob = prob[:, :-1]
+    else:
+        prob = torch.sigmoid(logits)
 
-        if i in label and len(label[i]["class_labels"]) > 0:
+    if isinstance(thres, float):
+        v, pos = torch.max(prob, dim=1)
+        reserve = v > thres
+    else:
+        reserve = reserve > thres
+        reserve = reserve.any(dim=1)
+
+    if label is not None:
+        o = {}
+        o["pred_boxes"] = pred_boxes.unsqueeze(0)
+        o["logits"] = logits.unsqueeze(0)
+        match_res = matcher(o, [label])
+        match_res = match_res[0]
+        r = torch.zeros_like(reserve, dtype=torch.bool)
+        r[match_res[0]] = True
+        reserve2 = reserve | r
+        print("check whether reserve ", sum(reserve), sum(reserve2))
+        reserve = reserve2
+    # else:
+    #     reserve = v > thres
+
+    # v, pos = torch.max(prob, dim=1)
+    logits = logits[reserve]
+    pred_boxes = pred_boxes[reserve]
+    embed = output["last_hidden_state"].squeeze(0)
+    embed = embed[reserve]
+
+    pos = torch.zeros((pred_boxes.shape[0], 5))
+    pos[:, 0] = label["pos"]
+    if "zposmax" in label:
+        pos[:, 0] /= label["zposmax"]
+    else:
+        pos[:, 0] /= 500
+    # print(pred_boxes)
+    pos[:, 1] = pred_boxes[:, 0]  # * (label["size"][0] / target_size[0])
+    pos[:, 2] = pred_boxes[:, 1]  # * (label["size"][1] / target_size[1])
+    pos[:, 3] = pred_boxes[:, 2]  # * (label["size"][0] / target_size[0])
+    pos[:, 4] = pred_boxes[:, 3]  # * (label["size"][1] / target_size[1])
+    input = torch.concat([pos, logits, embed], dim=1)
+    ret.append(input)
+    targets = torch.zeros((pred_boxes.shape[0]), dtype=torch.long)
+    targets.fill_(empty)
+    box_mask = torch.zeros((pred_boxes.shape[0]), dtype=torch.bool)
+    boxes = torch.zeros((pred_boxes.shape[0], 4))
+    item_id = ["" for i in range(pred_boxes.shape[0])]
+
+    if label is not None:
+        if len(label["class_labels"]) > 0:
             o = {}
             o["pred_boxes"] = pred_boxes.unsqueeze(0)
             o["logits"] = logits.unsqueeze(0)
-            match_res = matcher(o, [label[i]])
+            # print(o, label[i])
+            match_res = matcher(o, [label])
             match_res = match_res[0]
-            reserve = v > thres
-            r = torch.zeros_like(reserve, dtype=torch.bool)
-            r[match_res[0]] = True
-            reserve2 = reserve | r
-            print("check whether reserve ", sum(reserve), sum(reserve2))
-            reserve = reserve2
-        else:
-            reserve = v > thres
+            target = label["class_labels"]
+            target = target[match_res[1]]
+            # print(targets, target)
+            target_boxes = label["boxes"]
+            target_boxes = target_boxes[match_res[1]]
 
-        v, pos = torch.max(prob, dim=1)
-        logits = logits[reserve]
-        pred_boxes = pred_boxes[reserve]
-        embed = _output["last_hidden_state"].squeeze(0)
-        embed = embed[reserve]
-        if single:
-            model_idx = torch.zeros((pred_boxes.shape[0], 1))
-            model_idx[:, 0] = idx
-        else:
-            model_idx = torch.zeros((pred_boxes.shape[0], len(model_names)))
-            model_idx[:, idx] = 1.0
-
-        pos = torch.zeros((pred_boxes.shape[0], 5))
-        pos[:, 0] = label["pos"]
-        if "zposmax" in label:
-            pos[:, 0] /= label["zposmax"]
-        else:
-            pos[:, 0] /= 500
-        # print(pred_boxes)
-        pos[:, 1] = pred_boxes[:, 0] * (label["size"][0] / target_size[0])
-        pos[:, 2] = pred_boxes[:, 1] * (label["size"][1] / target_size[1])
-        pos[:, 3] = pred_boxes[:, 2] * (label["size"][0] / target_size[0])
-        pos[:, 4] = pred_boxes[:, 3] * (label["size"][1] / target_size[1])
-        input = torch.concat([model_idx, pos, logits, embed], dim=1)
-        ret.append(input)
-        targets = torch.zeros((pred_boxes.shape[0]), dtype=torch.long)
-        box_mask = torch.zeros((pred_boxes.shape[0]), dtype=torch.bool)
-        boxes = torch.zeros((pred_boxes.shape[0], 4))
-        item_id = ["" for i in range(pred_boxes.shape[0])]
-
-        if i in label:
-
-            if len(label[i]["class_labels"]) > 0:
-                o = {}
-                o["pred_boxes"] = pred_boxes.unsqueeze(0)
-                o["logits"] = logits.unsqueeze(0)
-                # print(o, label[i])
-                match_res = matcher(o, [label[i]])
-                match_res = match_res[0]
-                target = label[i]["class_labels"]
-                target = target[match_res[1]]
-                # print(targets, target)
-                target_boxes = label[i]["boxes"]
-                target_boxes = target_boxes[match_res[1]]
-
+            if "item_id" in label:
                 for s, t in zip(match_res[0], match_res[1]):
-                    item_id[s] = label[i]["item_id"][t]
+                    item_id[s] = label["item_id"][t]
 
-                boxes[match_res[0]] = target_boxes
-                box_mask[match_res[0]] = True
-                print(box_mask.shape, boxes.shape)
-                targets[match_res[0]] = target
-            if "masks" in label[i]:
-                masks.append(label[i]["masks"])
-        l.append(targets)
-        box_masks.append(box_mask)
-        boxeses.append(boxes)
-        item_ids.append(item_id)
+            boxes[match_res[0]] = target_boxes
+            box_mask[match_res[0]] = True
+            print(box_mask.shape, boxes.shape)
+            targets[match_res[0]] = target
+
+            if "masks" in label:
+                masks.append(label["masks"][match_res[1]])
+
+    l.append(targets)
+    box_masks.append(box_mask)
+    boxeses.append(boxes)
+    item_ids.append(item_id)
 
     return {
         "feature": ret,
@@ -621,9 +650,9 @@ def buildStage2(
     dataset,
     target_size,
     thres,
-    model_names=["other", "ribo"],
+    # model_names=["other", "ribo"],
     has_none=False,
-    single=True,
+    empty=5,
 ):
     ret = []
     l = []
@@ -632,6 +661,7 @@ def buildStage2(
     boxes = []
     item_ids = []
     images = []
+    pixel_masks = []
     sample_mapping = {}
     ret_dict = {
         "feature": ret,
@@ -641,6 +671,7 @@ def buildStage2(
         "boxes": boxes,
         "item_id": item_ids,
         "images": images,
+        "pixel_masks": pixel_masks,
         "sample_mapping": sample_mapping,
     }
     cnts = 0
@@ -650,11 +681,13 @@ def buildStage2(
         label = data["labels"]
         with torch.no_grad():
             _ret_dict = processSingle(
-                model, label, data, target_size, model_names, thres, has_none, single
+                model, label, data, target_size, thres, has_none, empty
             )
+
         for j in _ret_dict:
             ret_dict[j].extend(_ret_dict[j])
         ret_dict["images"].append(data["pixel_values"])
+        ret_dict["pixel_masks"].append(data["pixel_mask"])
         # print(_ret_dict["item_id"])
         for i in _ret_dict["item_id"]:
             for j in range(len(i)):
@@ -677,64 +710,170 @@ def buildStage2(
     # return ret, l
 
 
+def process(outputs, labels, empty=5):
+    ret = []
+    boxeses = []
+    box_masks = []
+    l = []
+    item_ids = []
+    logits = outputs["logits"]
+    device = logits.device
+    slice_num, num_obj, _ = logits.shape
+    pred_boxes = outputs["pred_boxes"]
+
+    match_res = matcher(outputs, labels)
+    for i in range(slice_num):
+        label = labels[i]
+        pos = torch.zeros((num_obj, 5)).to(device)
+        pos[:, 0] = label["pos"]
+        if "zposmax" in label:
+            pos[:, 0] /= label["zposmax"]
+        else:
+            pos[:, 0] /= 500
+        pos[:, 1:5] = pred_boxes[i][:, 0:4]
+
+        logit = logits[i]
+        embed = outputs["last_hidden_state"][i]
+        input = torch.concat([pos, logit, embed], dim=1)
+        ret.append(input)
+
+        targets = torch.zeros((num_obj), dtype=torch.long).to(device)
+        targets.fill_(empty)
+        targets[match_res[i][0]] = label["class_labels"][match_res[i][1]]
+        box_mask = torch.zeros((num_obj), dtype=torch.bool).to(device)
+        box_mask[match_res[i][0]] = True
+        boxes = torch.zeros((num_obj, 4)).to(device)
+        boxes[match_res[i][0]] = label["boxes"][match_res[i][1]]
+
+        item_id = ["" for i in range(num_obj)]
+        if "item_id" in label:
+            for s, t in zip(match_res[i][0], match_res[i][1]):
+                item_id[s] = label["item_id"][t]
+
+        boxeses.append(boxes)
+        l.append(targets)
+        item_ids.append(item_id)
+        box_masks.append(box_mask)
+    ret = torch.cat(ret, dim=0)
+    l = torch.cat(l, dim=0)
+    box_masks = torch.cat(box_masks, dim=0)
+    boxeses = torch.cat(boxeses, dim=0)
+    item_ids = [i for j in item_ids for i in j]
+    return {
+        "feature": ret,
+        "label": l,
+        "box_mask": box_masks,
+        "boxes": boxeses,
+        "item_id": item_ids,
+    }
+
+
 from sklearn.neighbors import NearestNeighbors
 from torch_geometric.data import Data
+from transformers.image_transforms import center_to_corners_format
+
+import modules
 
 
-def get_neighbors(X, z=500.0, x=500.0, y=500.0, radius=15):
-    t = X[:, 1:6]
-    t = t.numpy().copy()
-    t[:, 0] *= z
-    t[:, 1] *= x
-    # print(t, y)
-    t[:, 2] *= y
-    t[:, 3] *= x
-    t[:, 4] *= y
-    xs = []
-    ys = []
-    for i in range(t.shape[0] - 1):
-        for j in range(i + 1, t.shape[0]):
-            d = np.linalg.norm(t[i, 1:4] - t[j, 1:4])
-            d2 = np.linalg.norm(t[i, 3:5])
-            d3 = np.linalg.norm(t[j, 3:5])
-            d1 = min(d2, d3)
-            if d < radius + d1:
-                xs.append(i)
-                ys.append(j)
-                xs.append(j)
-                ys.append(i)
-    # radius_neighbors = NearestNeighbors(radius=radius)
-    # radius_neighbors.fit(t)
-    # neighbors = radius_neighbors.radius_neighbors(t, return_distance=False)
-    return xs, ys
+def get_neighbors(X, z_thres1=0.03, z_thres2=0.25, iou_thres=0.6):
+    iou, _ = modules.box_iou(
+        center_to_corners_format(X[:, 1:5]), center_to_corners_format(X[:, 1:5])
+    )
+    x, y = torch.where(iou > 0.2)
+    zposx = X[:, 0][x]
+    zposy = X[:, 0][y]
+    x = x[torch.abs(zposx - zposy) < z_thres1]
+    y = y[torch.abs(zposx - zposy) < z_thres1]
+
+    x1, y1 = torch.where(iou > iou_thres)
+    zposx = X[:, 0][x1]
+    zposy = X[:, 0][y1]
+    need = (zposx != zposy) & (torch.abs(zposx - zposy) < z_thres2)
+    x1 = x1[need]
+    y1 = y1[need]
+    x = torch.cat([x, x1])
+    y = torch.cat([y, y1])
+    return x, y
+
+    # dis = 1 - iou
+    # t = t.numpy().copy()
+    # t[:, 0] *= z
+    # t[:, 1] *= x
+    # # print(t, y)
+    # t[:, 2] *= y
+    # t[:, 3] *= x
+    # t[:, 4] *= y
+    # xs = []
+    # ys = []
+    # for i in range(t.shape[0] - 1):
+    #     for j in range(i + 1, t.shape[0]):
+    #         # d = np.linalg.norm(t[i, :3] - t[j, :3])
+    #         # d2 = np.linalg.norm(t[i, 3:5])
+    #         # d3 = np.linalg.norm(t[j, 3:5])
+    #         # d1 = max(d2, d3) / 2
+    #         if np.abs(t[i, 0] - t[j, 0]) < 0.00001:
+    #             if dis[i, j] < 0.99:
+    #                 xs.append(i)
+    #                 ys.append(j)
+    #                 xs.append(j)
+    #                 ys.append(i)
+    #         else:
+    #             if dis[i, j] + np.abs(t[i, 0] - t[j, 0]) < radius:
+    #                 xs.append(i)
+    #                 ys.append(j)
+    #                 xs.append(j)
+    #                 ys.append(i)
+    # # radius_neighbors = NearestNeighbors(radius=radius)
+    # # radius_neighbors.fit(t)
+    # # neighbors = radius_neighbors.radius_neighbors(t, return_distance=False)
+    # return xs, ys
 
 
-def convertStage2Dataset(retdict, x=500, y=500, z=500, radius=15):
+def convertStage2Dataset(retdict, z_thres1=0.01, z_thres2=0.2, iou_thres=0.6):
     X = retdict["feature"]
-    xs, ys = get_neighbors(X, z=z, x=x, y=y, radius=radius)
+
+    # print("building up neighboring graph")
+    xs, ys = get_neighbors(X, z_thres1=z_thres1, z_thres2=z_thres2, iou_thres=iou_thres)
+    # print(xs, ys, len(xs), len(ys))
+
+    # print("building up neighboring graph done")
 
     y = retdict["label"]
     box_masks = retdict["box_mask"]
     boxes = retdict["boxes"]
     item_ids = retdict["item_id"]
 
-    source = []
-    dest = []
-    edge_label = []
-    for i, j in zip(xs, ys):
-        source.append(i)
-        dest.append(j)
-        if item_ids[i] == item_ids[j] and item_ids[i] != "":
-            edge_label.append(1)
-        else:
-            edge_label.append(0)
-    edges = torch.tensor([source, dest], dtype=torch.long)
+    item_mapping = {"": -1}
+    for i in item_ids:
+        if i not in item_mapping:
+            item_mapping[i] = len(item_mapping)
+    item_ids = [item_mapping[i] for i in item_ids]
+    item_ids = torch.tensor(item_ids, dtype=torch.long).to(X.device)
+    item_idx = item_ids[xs]
+    item_idy = item_ids[ys]
+    edge_label = (item_idx == item_idy) & (item_idx != -1)
+    edge_label = edge_label.long()
+    # source = []
+    # dest = []
+    # edge_label = []
+    # for i, j in zip(xs, ys):
+    #     source.append(i)
+    #     dest.append(j)
+    #     if item_ids[i] == item_ids[j] and item_ids[i] != "":
+    #         edge_label.append(1)
+    #     else:
+    #         edge_label.append(0)
+    edges = torch.stack([xs, ys])
+    # print(edges.shape)
 
     t = Data(x=X, edge_index=edges, y=y)
     t.box_masks = box_masks
     t.boxes = boxes
     t.edge_label = torch.tensor(edge_label, dtype=torch.long)
-
+    if "sample_mapping" in retdict:
+        t.sample_mapping = torch.tensor(
+            [i for i in retdict["sample_mapping"].values()], dtype=int
+        )
     return t
 
 
@@ -753,6 +892,113 @@ def get_stage2_model_embeddings(config_path, dataset, checkpoint_path="last.ckpt
     return res
 
 
+def get_stage12_dataset(configs):
+    if configs["data"]["transform"] == "default":
+        t = getDefaultTransform()
+    elif configs["data"]["transform"] == "simple":
+        t = getSimpleTransform()
+    else:
+        t = getConstantTransform()
+
+    if "norm" not in configs["data"]:
+        configs["data"]["norm"] = "none"
+
+    if "num" not in configs["data"]:
+        configs["data"]["num"] = 5
+
+    # dataset = modules.CocoDetection(
+    #     configs["image_path"],
+    #     configs["annotation_path"],
+    #     is_npy=configs["is_npy"],
+    #     transform=t,
+    #     require_mask=configs["is_segmentation"],
+    # )  # , transform=transforms)
+    # train_set, val_set = torch.utils.data.random_split(dataset, [0.8, 0.2])
+    if isinstance(configs["data"]["annotation_path_train"], list):
+        train_sets = []
+        for i in configs["data"]["annotation_path_train"]:
+            map_class = None
+            if "map_class" in configs["data"]:
+                map_class = configs["data"]["map_class"]
+            train_sets.append(
+                modules.CocoDetection2(
+                    configs["data"]["num"],
+                    configs["data"]["image_path"],
+                    i,
+                    is_npy=configs["data"]["is_npy"],
+                    transform=t,
+                    require_mask=configs["data"]["require_mask"],
+                    filter_class=configs["data"]["filter_class"],
+                    single_class=configs["data"]["single_class"],
+                    norm=configs["data"]["norm"],
+                    map_class=map_class,
+                )
+            )
+        train_sets = torch.utils.data.ConcatDataset(train_sets)
+    else:
+        map_class = None
+        if "map_class" in configs["data"]:
+            map_class = configs["data"]["map_class"]
+        train_sets = modules.CocoDetection2(
+            configs["data"]["num"],
+            configs["data"]["image_path"],
+            configs["data"]["annotation_path_train"],
+            is_npy=configs["data"]["is_npy"],
+            transform=t,
+            require_mask=configs["data"]["require_mask"],
+            filter_class=configs["data"]["filter_class"],
+            single_class=configs["data"]["single_class"],
+            norm=configs["data"]["norm"],
+            map_class=map_class,
+        )
+
+    if isinstance(configs["data"]["annotation_path_val"], list):
+        val_sets = []
+        for i in configs["data"]["annotation_path_val"]:
+            map_class = None
+            if "map_class" in configs["data"]:
+                map_class = configs["data"]["map_class"]
+            val_sets.append(
+                modules.CocoDetection2(
+                    configs["data"]["num"],
+                    configs["data"]["image_path"],
+                    i,
+                    is_npy=configs["data"]["is_npy"],
+                    transform=getConstantTransform(),
+                    require_mask=configs["data"]["require_mask"],
+                    filter_class=configs["data"]["filter_class"],
+                    single_class=configs["data"]["single_class"],
+                    norm=configs["data"]["norm"],
+                    map_class=map_class,
+                )
+            )
+        val_sets = torch.utils.data.ConcatDataset(val_sets)
+    else:
+        val_sets = modules.CocoDetection2(
+            configs["data"]["num"],
+            configs["data"]["image_path"],
+            configs["data"]["annotation_path_val"],
+            is_npy=configs["data"]["is_npy"],
+            transform=getConstantTransform(),
+            require_mask=configs["data"]["require_mask"],
+            filter_class=configs["data"]["filter_class"],
+            single_class=configs["data"]["single_class"],
+            norm=configs["data"]["norm"],
+            map_class=map_class,
+        )
+
+    ds = modules.EMDataModule(
+        train_sets,
+        val_sets,
+        configs["training"]["train_batch_size"],
+        configs["training"]["val_batch_size"],
+        False,
+    )
+    # print("here build dataset stage 1")
+    # print(ds)
+    return ds
+
+
 def get_stage1_dataset(configs):
     if configs["data"]["transform"] == "default":
         t = getDefaultTransform()
@@ -764,47 +1010,67 @@ def get_stage1_dataset(configs):
     if "norm" not in configs["data"]:
         configs["data"]["norm"] = "none"
 
-    # dataset = modules.CocoDetection(
-    #     configs["image_path"],
-    #     configs["annotation_path"],
-    #     is_npy=configs["is_npy"],
-    #     transform=t,
-    #     require_mask=configs["is_segmentation"],
-    # )  # , transform=transforms)
-    # train_set, val_set = torch.utils.data.random_split(dataset, [0.8, 0.2])
-    train_sets = {}
-    for i in configs["data"]["filter_class"]:
+    if isinstance(configs["data"]["filter_class"], dict):
+        train_sets = {}
+        for i in configs["data"]["filter_class"]:
+            map_class = None
+            if "map_class" in configs["data"]:
+                map_class = configs["data"]["map_class"]
+            train_sets[i] = modules.CocoDetection(
+                configs["data"]["image_path"],
+                configs["data"]["annotation_path_train"],
+                is_npy=configs["data"]["is_npy"],
+                transform=t,
+                require_mask=configs["data"]["require_mask"][i],
+                filter_class=configs["data"]["filter_class"][i],
+                single_class=configs["data"]["single_class"][i],
+                norm=configs["data"]["norm"],
+                map_class=map_class,
+                mark=i,
+            )
+
+        val_sets = {}
+        for i in configs["data"]["filter_class"]:
+            map_class = None
+            if "map_class" in configs["data"]:
+                map_class = configs["data"]["map_class"]
+            val_sets[i] = modules.CocoDetection(
+                configs["data"]["image_path"],
+                configs["data"]["annotation_path_val"],
+                is_npy=configs["data"]["is_npy"],
+                transform=getConstantTransform(),
+                require_mask=configs["data"]["require_mask"][i],
+                filter_class=configs["data"]["filter_class"][i],
+                single_class=configs["data"]["single_class"][i],
+                norm=configs["data"]["norm"],
+                map_class=map_class,
+                mark=i,
+            )
+    else:
         map_class = None
         if "map_class" in configs["data"]:
             map_class = configs["data"]["map_class"]
-        train_sets[i] = modules.CocoDetection(
+        train_sets = modules.CocoDetection(
             configs["data"]["image_path"],
             configs["data"]["annotation_path_train"],
             is_npy=configs["data"]["is_npy"],
             transform=t,
-            require_mask=configs["data"]["require_mask"][i],
-            filter_class=configs["data"]["filter_class"][i],
-            single_class=configs["data"]["single_class"][i],
+            require_mask=configs["data"]["require_mask"],
+            filter_class=configs["data"]["filter_class"],
+            single_class=configs["data"]["single_class"],
             norm=configs["data"]["norm"],
             map_class=map_class,
-            mark=i,
         )
-    val_sets = {}
-    for i in configs["data"]["filter_class"]:
-        map_class = None
-        if "map_class" in configs["data"]:
-            map_class = configs["data"]["map_class"]
-        val_sets[i] = modules.CocoDetection(
+        val_sets = modules.CocoDetection(
             configs["data"]["image_path"],
             configs["data"]["annotation_path_val"],
             is_npy=configs["data"]["is_npy"],
             transform=getConstantTransform(),
-            require_mask=configs["data"]["require_mask"][i],
-            filter_class=configs["data"]["filter_class"][i],
-            single_class=configs["data"]["single_class"][i],
+            require_mask=configs["data"]["require_mask"],
+            filter_class=configs["data"]["filter_class"],
+            single_class=configs["data"]["single_class"],
             norm=configs["data"]["norm"],
             map_class=map_class,
-            mark=i,
         )
 
     # train_set, _val_set = torch.utils.data.random_split(dataset1, [0.8, 0.2])
@@ -843,10 +1109,14 @@ def get_stage2_dataset(configs):
     for i in configs["data"]["val"]:
         data_list_val.append(torch.load(i))
 
+    if "aug" not in configs["data"]:
+        configs["data"]["aug"] = True
+
     ds = modules.stage2DataModule(
         data_list_train,
         data_list_val,
         configs["data"]["dataset_len"],
+        ifaug=configs["data"]["aug"],
     )
 
     return ds
@@ -857,16 +1127,28 @@ def get_stageMask_dataset(configs):
     embeds = []
     masks = []
     sample_mapping = {}
+    num1 = 0
+    num2 = 0
     for i in configs["data"]["datasets"]:
         data = torch.load(i)
-        pixels.append(data["pixel_values"])
+        pixels.extend(data["pixel_values"])
         embeds.append(data["embed"])
         masks.append(data["masks"])
-        sample_mapping.update(data["sample_mapping"])
-    pixels = torch.cat(pixels, dim=0)
+        for j in data["sample_mapping"]:
+            sample_mapping[j + num1] = data["sample_mapping"][j] + num2
+        num1 += len(data["sample_mapping"])
+        num2 += len(data["pixel_values"])
+        # sample_mapping.update(data["sample_mapping"])
+    pixels = torch.stack(pixels, dim=0)
     embeds = torch.cat(embeds, dim=0)
     masks = torch.cat(masks, dim=0)
-    ds = modules.stage2MaskDataModule(pixels, embeds, masks, sample_mapping)
+    ds = modules.stage2MaskDataModule(
+        pixels,
+        embeds,
+        masks,
+        sample_mapping,
+        batch_size=configs["training"]["train_batch_size"],
+    )
     return ds
 
 
@@ -876,7 +1158,7 @@ def loadModel(path, checkpoint="last.ckpt"):
 
     model = getModel(configs)
 
-    ckpt = torch.load(os.path.join(path, checkpoint))["state_dict"]
+    ckpt = torch.load(os.path.join(path, checkpoint), map_location="cpu")["state_dict"]
 
     p = list(model.state_dict().keys())  # [j for j, _ in model.named_parameters()]
     # print("model parameters ", p)

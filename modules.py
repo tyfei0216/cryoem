@@ -19,6 +19,7 @@ from pycocotools.coco import COCO
 from pytorch_lightning.utilities.combined_loader import CombinedLoader
 from skimage import exposure
 from torch.utils.data import Dataset
+from torch_geometric.data import Data
 from torch_geometric.data import Dataset as Gdataset
 from torchvision.tv_tensors import BoundingBoxes, Mask
 from transformers.image_transforms import center_to_corners_format
@@ -84,11 +85,13 @@ class stage2Dataset(Gdataset):
 
 
 class stage2DatasetNew(Gdataset):
-    def __init__(self, dataset_list, dataset_len, train=True, seed=1013):
+    def __init__(self, dataset_list, dataset_len, train=True, seed=1013, aug=True):
         super().__init__()
         self.dataset_list = []
         self.dataset_len = dataset_len
         random.seed(seed)
+        self.if_train = train
+        self.aug = aug
         for i in dataset_list:
             a = list(range(i.x.shape[0]))
             # train = random.sample(a, int(len(a) * train_val[0]))
@@ -112,6 +115,17 @@ class stage2DatasetNew(Gdataset):
 
                 i.edge_train_mask = edge_train_mask
                 i.edge_val_mask = edge_val_mask
+
+            if hasattr(i, "sample_mapping"):
+                sample_mapping = {}
+                now = -1
+                for j, k in enumerate(i.sample_mapping):
+                    if k.item() != now:
+                        now = k.item()
+                        sample_mapping[k.item()] = j
+                sample_mapping[now + 1] = i.sample_mapping.shape[0]
+                i.samples = sample_mapping
+                # print(sample_mapping)
             self.dataset_list.append(i)
 
     def len(self):
@@ -119,6 +133,39 @@ class stage2DatasetNew(Gdataset):
 
     def get(self, idx):
         t = idx % len(self.dataset_list)
+        ret = self.dataset_list[t]
+        # return ret
+        if self.if_train:
+            if hasattr(ret, "samples") and self.aug:
+                sample_mapping = ret.samples
+                n = len(sample_mapping) - 1
+                pick = random.randint(0, max(0, n - 15)) + 15
+                if n <= pick:
+                    pick = n
+                start = random.randint(0, n - pick)
+                end = start + pick
+                need_nodes = torch.zeros_like(ret.y, dtype=torch.bool)
+                need_nodes[sample_mapping[start] : sample_mapping[end]] = True
+                need_edges = (
+                    need_nodes[ret.edge_index[0]] & need_nodes[ret.edge_index[1]]
+                )
+                ret2 = Data(x=ret.x, edge_index=ret.edge_index[:, need_edges])
+                ret2.edge_train_mask = ret.edge_train_mask[need_edges]
+                ret2.edge_val_mask = ret.edge_val_mask[need_edges]
+                ret2.sample_mapping = ret.sample_mapping  # [need_nodes]
+                ret2.y = ret.y  # [need_nodes]
+                ret2.box_masks = ret.box_masks  # [need_nodes]
+                ret2.boxes = ret.boxes  # [need_nodes]
+                ret2.train_mask = ret.train_mask & need_nodes
+                ret2.val_mask = ret.val_mask & need_nodes
+                ret2.edge_label = ret.edge_label[need_edges]
+                # print(ret2)
+                return ret2
+            else:
+                return ret
+        else:
+            return ret
+
         return self.dataset_list[t]
 
 
@@ -176,28 +223,35 @@ class stage2DataModule(L.LightningDataModule):
         dataset_list_train,
         dataset_list_val,
         dataset_len,
+        ifaug=True,
     ):
         super().__init__()
 
         self.dataset_train = dataset_list_train
         self.dataset_val = dataset_list_val
         self.dataset_len = dataset_len
+        self.ifaug = ifaug
+        if ifaug:
+            print("use node augmentation")
 
     def train_dataloader(self):
         # ds = stage2Dataset(self.dataset, self.dataset_len[0], self.train_val, self.seed)
-        ds = stage2DatasetNew(self.dataset_train, self.dataset_len[0], True)
+        ds = stage2DatasetNew(
+            self.dataset_train, self.dataset_len[0], True, aug=self.ifaug
+        )
         return torch.utils.data.DataLoader(
-            ds, batch_size=1, collate_fn=utils.collect_graph
+            ds, batch_size=1, collate_fn=utils.collect_graph, num_workers=8
         )
 
     def val_dataloader(self):
         # ds = stage2Dataset(self.dataset, self.dataset_len[1], self.train_val, self.seed)
-        ds = stage2DatasetNew(self.dataset_val, self.dataset_len[1], False)
+        ds = stage2DatasetNew(self.dataset_val, self.dataset_len[1], False, aug=False)
         return torch.utils.data.DataLoader(
-            ds, batch_size=1, collate_fn=utils.collect_graph
+            ds, batch_size=1, collate_fn=utils.collect_graph, num_workers=1
         )
 
 
+# used to separated different labels sets, only used for visualization
 class CocoTraverse(torchvision.datasets.vision.VisionDataset):
     def __init__(
         self,
@@ -468,6 +522,7 @@ class CocoTraverse(torchvision.datasets.vision.VisionDataset):
         return ret
 
 
+# main class
 class CocoDetection(torchvision.datasets.vision.VisionDataset):
 
     def __init__(
@@ -498,7 +553,6 @@ class CocoDetection(torchvision.datasets.vision.VisionDataset):
         self.require_mask = require_mask
         self.filter_class = filter_class
         self.single_class = single_class
-        self.mapping_class = None
         if map_class is not None:
             mc = {}
             for i, j in map_class.items():
@@ -524,6 +578,7 @@ class CocoDetection(torchvision.datasets.vision.VisionDataset):
         self.return_single = return_single
         self.filtermin = filtermin
         self._filterIds()
+        # self.zpos = []
 
     def _load_image(self, id: int):
         if self.is_npy:
@@ -536,29 +591,36 @@ class CocoDetection(torchvision.datasets.vision.VisionDataset):
             return Image.open(os.path.join(self.root, path)).convert("RGB")
 
     def _load_target(self, id: int):
-        if self.filter_class is None:
-            ret = self.coco.loadAnns(self.coco.getAnnIds(id))
-            if len(ret) < self.filtermin:
-                return []
-            return self.coco.loadAnns(self.coco.getAnnIds(id))
+        if "zpos" in self.coco.loadImgs(id)[0]:
+            pos = self.coco.loadImgs(id)[0]["zpos"]
         else:
-            t = self.coco.loadAnns(self.coco.getAnnIds(id))
-            if len(t) < self.filtermin:
-                return []
+            pos = 0
+        t = self.coco.loadAnns(self.coco.getAnnIds(id))
+
+        if self.filter_class is not None:
             t = list(filter(lambda x: x["category_id"] in self.filter_class, t))
-            return t
+
+        if len(t) < self.filtermin:
+            return [], 0
+        return t, pos
 
     def processAnnotations(self, annotations, image):
         # print(image.shape)
-        if self.mapping_class is not None:
-            labels = torch.tensor(
-                [self.mapping_class[sample["category_id"]] for sample in annotations],
-                dtype=torch.long,
-            )
-        else:
-            labels = torch.tensor(
-                [sample["category_id"] for sample in annotations], dtype=torch.long
-            )
+        # if self.mapping_class is not None:
+        #     labels = torch.tensor(
+        #         [self.mapping_class[sample["category_id"]] for sample in annotations],
+        #         dtype=torch.long,
+        #     )
+        # else:
+        labels = torch.tensor(
+            [sample["category_id"] for sample in annotations], dtype=torch.long
+        )
+
+        if self.add_classname:
+            names = []
+            for i in labels:
+                names.append(self.classes.loc[i.item()]["name"])
+
         if self.single_class:
             assert self.map_class is None
             labels = torch.zeros_like(labels)
@@ -577,6 +639,12 @@ class CocoDetection(torchvision.datasets.vision.VisionDataset):
         bt = torchvision.ops.box_convert(torch.Tensor(bbboxes), "xywh", "xyxy")
         boxes = BoundingBoxes(bt, format="xyxy", canvas_size=image.shape[1:])
 
+        retdict = {"bboxes": boxes, "class_labels": labels}
+
+        if "item_id" in annotations[0]:
+            item_id = [sample["item_id"] for sample in annotations]
+            retdict["item_id"] = item_id
+
         if self.require_mask:
             masks = torch.stack(
                 [
@@ -587,22 +655,30 @@ class CocoDetection(torchvision.datasets.vision.VisionDataset):
                 ],
                 dim=0,
             )
-            return {"masks": Mask(masks), "bboxes": boxes, "class_labels": labels}
-        else:
-            return {"bboxes": boxes, "class_labels": labels}
+            retdict["masks"] = Mask(masks)
+        #     return {"masks": Mask(masks), "bboxes": boxes, "class_labels": labels}
+        # else:
+        #     return {"bboxes": boxes, "class_labels": labels}
+        if self.add_classname:
+            retdict["names"] = names
+        return retdict
 
     def __len__(self):
         return len(self.needids)
 
     def _filterIds(self):
         needids = []
+        zposes = []
+        itemids = {}
         for i in range(len(self.ids)):
-            annotation = self._load_target(self.ids[i])
-            if len(annotation) > 0:
+            annotation, zpos = self._load_target(self.ids[i])
+            if len(annotation) >= self.filtermin:
                 needids.append(i)
+                zposes.append(zpos)
             # if len(self.coco.loadAnns(self.coco.getAnnIds(i))) > 0:
             #     need.append(i)
         self.needids = needids
+        self.zpos = zposes
         # print(needids)
 
     def _getitem(self, index):
@@ -619,13 +695,14 @@ class CocoDetection(torchvision.datasets.vision.VisionDataset):
         elif self.norm == "hist":
             for i in range(3):
                 image[i] = exposure.equalize_hist(image[i])
-        target = self._load_target(id)
+        target, _ = self._load_target(id)
 
         return image, target
 
     def __getitem__(self, idx):
         # idx1 = idx
         if self.needids is not None:
+            zpos = self.zpos[idx]
             idx = self.needids[idx]
 
         # used to return a single image, used for debugging
@@ -639,6 +716,11 @@ class CocoDetection(torchvision.datasets.vision.VisionDataset):
             raise ValueError
         image = torch.tensor(image)
         target = self.processAnnotations(annotation, image)
+
+        ori_class_labels = target["class_labels"].clone()
+        target["class_labels"] = torch.tensor(
+            range(len(target["class_labels"])), dtype=torch.long
+        )
 
         if self.transform is not None:
             image, target = self.transform(image, target)
@@ -701,17 +783,40 @@ class CocoDetection(torchvision.datasets.vision.VisionDataset):
             (len(target["class_labels"])), dtype=torch.int64
         )
 
-        if self.add_classname:
-            target["names"] = []
-            for i in target["class_labels"]:
-                target["names"].append(self.classes.loc[i.item()]["name"])
+        target["pos"] = zpos
+        # print(target["class_labels"])
+        for i in ["names", "item_id"]:
+            if i in target:
+                target[i] = [target[i][j.item()] for j in target["class_labels"]]
+        target["class_labels"] = ori_class_labels[target["class_labels"]]
 
-        return {
+        ret = {
             "pixel_values": image,
             "pixel_mask": mask,
             "labels": target,
-            "mark": self.mark,
         }
+        if self.mark is not None:
+            ret["mark"] = self.mark
+        return ret
+
+
+class CocoDetection2(CocoDetection):
+    def __init__(self, num, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        print("using batch size ", num)
+        self.num = num
+        self.seed = 42
+
+    def __len__(self):
+        return super().__len__() - self.num + 1
+
+    def __getitem__(self, idx):
+        self.seed = self.seed + 1
+        res = []
+        for i in range(self.num):
+            torch.manual_seed(self.seed)
+            res.append(super().__getitem__(idx + i))
+        return utils.stackBatch(res)
 
 
 # Deprecated
@@ -777,7 +882,7 @@ class AdditionalInputLayer(nn.Module):
 
     def forward(self, x):
         x = self.layer1(x)
-        x = nn.functional.relu6(x)
+        x = nn.functional.relu(x)
         x = self.layer2(x)
         return x
 
@@ -786,22 +891,21 @@ from torch import Tensor
 
 
 class WarmupScheduler(torch.optim.lr_scheduler._LRScheduler):
-    def __init__(self, optimizer, warmup_epochs, last_epoch=-1):
+    def __init__(self, optimizer, warmup_epochs, warmup_lr=1e-6, last_epoch=-1):
         self.warmup_epochs = warmup_epochs
+        self.warmup_lr = warmup_lr
         super(WarmupScheduler, self).__init__(optimizer, last_epoch)
         # self.base_lr = None
-        print(self.base_lrs)
+        # print(self.base_lrs)
 
     def get_lr(self):
         # if self.base_lr is None:
         # Get the base learning rate from the optimizer
         # self.base_lr = [group["lr"] for group in self.optimizer.param_groups]
         if self.last_epoch < self.warmup_epochs:
-            print(self.last_epoch)
+            # print(self.last_epoch)
             # Linear warmup: Scale LR linearly based on the epoch
-            return [
-                lr * (self.last_epoch + 1) / self.warmup_epochs for lr in self.base_lrs
-            ]
+            return [self.warmup_lr for lr in self.base_lrs]
         else:
             # After warmup, return the base LR
             return self.base_lrs
@@ -916,34 +1020,72 @@ def sigmoid_focal_loss(
     return loss.mean(1).sum() / num_boxes
 
 
+# def focal_loss(input, target, gamma=2):
+def loss_boxes(source_boxes, targets, num_boxes):
+    """
+    Compute the losses related to the bounding boxes, the L1 regression loss and the GIoU loss.
+
+    Targets dicts must contain the key "boxes" containing a tensor of dim [nb_target_boxes, 4]. The target boxes
+    are expected in format (center_x, center_y, w, h), normalized by the image size.
+    """
+
+    loss_bbox = nn.functional.mse_loss(source_boxes, targets, reduction="none")
+
+    # losses = {}
+    # losses["loss_bbox"] = loss_bbox.sum() / num_boxes
+
+    loss_giou = 1 - torch.diag(
+        generalized_box_iou(
+            center_to_corners_format(source_boxes),
+            center_to_corners_format(targets),
+        )
+    )
+    # print(source_boxes[0], targets[0])
+    # print(
+    #     loss_bbox,
+    #     loss_giou,
+    # )
+    loss_bbox = loss_bbox.mean()
+    loss_giou = loss_giou.mean()
+    # losses["loss_giou"] = loss_giou.sum() / num_boxes
+    return 5 * loss_bbox + 2 * loss_giou
+
+
 class DetrModel(L.LightningModule):
     def __init__(
         self,
         stage,
-        model_dict,
+        model,
         lr,
         weight_decay,
         feature_dim,
         output_dim,
         lr_detr=None,
         lr_backbone=None,
-        additional_input_dim=20,
+        additional_input_dim=10,
         additional_output_dim=16,
         layer_type="GCNConv",
         dropout=True,
         scheduler_step=-1,
+        warmup_epoches=1,
     ):
         super().__init__()
-        self.model = nn.ModuleDict(model_dict)
+        if isinstance(model, dict):
+            self.is_dict = True
+            self.model = nn.ModuleDict(model)
+        else:
+            self.is_dict = False
+            self.model = model
 
         assert stage in [
             "stage 1",
             "stage 2",
+            "stage 1 + 2",
             "stage mask",
         ]
         print("model at stage ", stage)
         self.stage = stage
-
+        self.warmup_epoches = warmup_epoches
         self.lr = lr
         self.lr_backbone = lr_backbone
         self.lr_detr = lr_detr
@@ -953,24 +1095,29 @@ class DetrModel(L.LightningModule):
         self.additional_input_dim = additional_input_dim
         self.additional_output_dim = additional_output_dim
 
-        self.additional_input_layer = AdditionalInputLayer(
-            additional_input_dim, additional_output_dim
-        )
+        # self.additional_input_layer = AdditionalInputLayer(
+        #     additional_input_dim, additional_output_dim
+        # )
 
-        self.acc = torchmetrics.Accuracy(task="multiclass", num_classes=output_dim)
-        self.auroc = torchmetrics.AUROC(
-            num_classes=output_dim, average="macro", task="binary"
+        self.acc = torchmetrics.Accuracy(
+            task="multiclass", num_classes=output_dim, average="macro"
         )
+        self.auroc = torchmetrics.AUROC(
+            num_classes=output_dim, average="macro", task="multiclass"
+        )
+        self.mask_auroc = torchmetrics.AUROC(task="binary")
+
         self.gnn = GCN(
             feature_dim + additional_output_dim,
+            additional_input_dim,
             output_dim,
             layer_type=layer_type,
             dropout=dropout,
         )
         t = torch.ones((output_dim))
-        t[0] = 0.1
+        t[-1] = 0.1
         self.cri = nn.CrossEntropyLoss(weight=t)
-
+        self.output_dim = output_dim
         self.mask_head = UNet(
             embed_dim=feature_dim + additional_output_dim, sigmoid=False
         )
@@ -989,27 +1136,34 @@ class DetrModel(L.LightningModule):
     ):
         if "stage 1" in self.stage:
             assert pixel_values is not None
-            ret = {}
-            if mark is not None:
-                ret[mark] = self.model[mark](
-                    pixel_values=pixel_values, pixel_mask=pixel_mask, labels=labels
-                )
-            else:
-                for i in self.model:
-                    ret[i] = self.model[i](
+            if self.is_dict:
+                ret = {}
+                if mark is not None:
+                    ret[mark] = self.model[mark](
                         pixel_values=pixel_values, pixel_mask=pixel_mask, labels=labels
                     )
-            return ret
+                else:
+                    for i in self.model:
+                        ret[i] = self.model[i](
+                            pixel_values=pixel_values,
+                            pixel_mask=pixel_mask,
+                            labels=labels,
+                        )
+                return ret
+            else:
+                return self.model(
+                    pixel_values=pixel_values, pixel_mask=pixel_mask, labels=labels
+                )
         elif "stage 2" in self.stage:
             assert x is not None
             assert edge_index is not None
-            additional_input, model_feature = (
-                x[:, : self.additional_input_dim],
-                x[:, self.additional_input_dim :],
-            )
-            additional_feature = self.additional_input_layer(additional_input)
-            inputs = torch.cat([model_feature, additional_feature], dim=1)
-            return self.gnn(inputs, edge_index)
+            # additional_input, model_feature = (
+            #     x[:, : self.additional_input_dim],
+            #     x[:, self.additional_input_dim :],
+            # )
+            # additional_feature = self.additional_input_layer(additional_input)
+            # inputs = torch.cat([model_feature, additional_feature], dim=1)
+            return self.gnn(x, edge_index)
 
         elif "stage mask" in self.stage:
             assert stage_2_embeds is not None
@@ -1030,28 +1184,28 @@ class DetrModel(L.LightningModule):
         are expected in format (center_x, center_y, w, h), normalized by the image size.
         """
 
-        loss_bbox = nn.functional.l1_loss(source_boxes, targets, reduction="none")
+        loss_bbox = nn.functional.mse_loss(source_boxes, targets)
 
         # losses = {}
         # losses["loss_bbox"] = loss_bbox.sum() / num_boxes
 
-        loss_giou = 1 - torch.diag(
-            generalized_box_iou(
-                center_to_corners_format(source_boxes),
-                center_to_corners_format(targets),
-            )
-        )
+        # loss_giou = 1 - torch.diag(
+        #     generalized_box_iou(
+        #         center_to_corners_format(source_boxes),
+        #         center_to_corners_format(targets),
+        #     )
+        # )
         # print(source_boxes[0], targets[0])
         # print(
         #     loss_bbox,
         #     loss_giou,
         # )
-        loss_bbox = loss_bbox.mean()
-        loss_giou = loss_giou.mean()
+        # loss_bbox = loss_bbox.mean()
+        # loss_giou = loss_giou.mean()
         # losses["loss_giou"] = loss_giou.sum() / num_boxes
-        return 5 * loss_bbox + 2 * loss_giou
+        return loss_bbox  # + 2 * loss_giou
 
-    def _common_step_stage1(self, batch, loss, loss_dict):
+    def _common_step_stage1(self, batch, loss, loss_dict, return_outputs=False):
         if batch is None:
             return loss, loss_dict
 
@@ -1059,27 +1213,46 @@ class DetrModel(L.LightningModule):
 
             pixel_values = batch["pixel_values"].to(self.device)
             pixel_mask = batch["pixel_mask"].to(self.device)
-            mark = batch["mark"][0]
+            if "mark" in batch:
+                mark = batch["mark"][0]
+            else:
+                mark = None
 
-            labels = [
-                {k: v.to(self.device) for k, v in t.items()} for t in batch["labels"]
-            ]
+            if mark == "":
+                mark = None
+            required_labels = []
+            for t in batch["labels"]:
+                sample = {}
+                for q in ["class_labels", "boxes", "masks"]:
+                    if q in t:
+                        sample[q] = t[q].to(self.device)
+                required_labels.append(sample)
+            # labels = [
+            #     {k: v.to(self.device) for k, v in t.items()} for t in batch["labels"]
+            # ]
 
             outputs = self(
                 pixel_values=pixel_values,
                 pixel_mask=pixel_mask,
-                labels=labels,
+                labels=required_labels,
                 mark=mark,
             )
-
-            loss += outputs[mark].loss
-            if loss_dict is None:
-                loss_dict = outputs[mark].loss_dict
+            if mark is not None:
+                loss += outputs[mark].loss
+                if loss_dict is None:
+                    loss_dict = outputs[mark].loss_dict
+                else:
+                    for i in loss_dict:
+                        loss_dict[i] += outputs[mark].loss_dict[i]
             else:
-                for i in loss_dict:
-                    loss_dict[i] += outputs[mark].loss_dict[i]
-
+                loss = outputs.loss
+                loss_dict = outputs.loss_dict
+            if return_outputs:
+                return loss, loss_dict, outputs
             return loss, loss_dict
+            return loss, loss_dict
+        else:
+            raise ValueError("not in stage 1")
 
     def common_step_stage1(self, batch):
         loss = 0
@@ -1103,11 +1276,12 @@ class DetrModel(L.LightningModule):
         y = y.to(self.device)
 
         ret_dict = self(x=x, edge_index=edge)
-
+        # print(ret_dict["predict"][mask].shape, y[mask].shape)
+        # print(torch.max(y[mask]))
         loss = self.cri(ret_dict["predict"][mask], y[mask])
         loss_dict = {
             "loss": loss,
-            "acc": self.acc(ret_dict["predict"][mask], y[mask]),
+            "auroc": self.auroc(ret_dict["predict"][mask].detach(), y[mask]),
         }
 
         if box is not None:
@@ -1152,11 +1326,12 @@ class DetrModel(L.LightningModule):
         stage_2_embeds = stage_2_embeds.to(self.device).float()
         mask = mask.to(self.device).float()
         outputs = self(pixel_values=pixel_values, stage_2_embeds=stage_2_embeds)
+        # print(mask.shape, outputs.shape)
         # print(outputs[0][:5])
         # print(mask[0][:5])
         loss = sigmoid_focal_loss(outputs, mask.float())
         if cal_auroc:
-            auroc = self.auroc(
+            auroc = self.mask_auroc(
                 outputs.detach().view(-1).cpu(), mask.detach().view(-1).cpu()
             )
             return loss, {"loss": loss, "auroc": auroc}
@@ -1169,14 +1344,41 @@ class DetrModel(L.LightningModule):
         if "stage mask" in self.stage:
             auroc = np.mean([i["auroc"] for i in self.val_step_outputs])
             self.log("total_validate_auroc", auroc)
+        if "stage 1 + 2" in self.stage:
+            auroc = np.mean([i["auroc"] for i in self.val_step_outputs])
+            self.log("total_validate_auroc", auroc, prog_bar=True)
+            loss_boxes = np.mean(
+                [i["loss_boxes"] for i in self.val_step_outputs if "loss_boxes" in i]
+            )
+            self.log("total_validate_loss_boxes", loss_boxes, prog_bar=True)
         # loss = np.mean(self.val_step_outputs)
-        self.log("total_validate_loss", losses)
+        self.log("total_validate_loss", losses, prog_bar=True)
         self.val_step_outputs.clear()
 
-    def training_step(self, batch, batch_idx, dataloader_idx=0):
+    def training_step(self, batch, batch_idx=0, loader_idx=0):
         # with open("./temp.pkl", "wb") as f:
         #     pickle.dump(batch, f)
-        if "stage 1" in self.stage:
+        # print(batch)
+        if "stage 1 + 2" in self.stage:
+            loss, loss_dict, output = self._common_step_stage1(batch[0], 0, None, True)
+            retdict = utils.process(output, batch[0]["labels"])
+            data2 = utils.convertStage2Dataset(retdict)
+            self.stage = "stage 2"
+            x = data2.x
+            y = data2.y
+            edge_index = data2.edge_index
+            mask = torch.ones_like(y, dtype=torch.bool)
+            boxes = data2.boxes if hasattr(data2, "boxes") else None
+            box_masks = data2.box_masks if hasattr(data2, "box_masks") else None
+            edge_label = data2.edge_label if hasattr(batch, "edge_label") else None
+            # edge_label = None
+            loss2, loss_dict2 = self.common_step_stage2(
+                x, edge_index, mask, y, boxes, box_masks, edge_label
+            )
+            self.stage = "stage 1 + 2"
+            loss = loss + loss2
+            loss_dict = loss_dict2
+        elif "stage 1" in self.stage:
             loss, loss_dict = self.common_step_stage1(batch)
         elif "stage 2" in self.stage:
             mask = batch.train_mask
@@ -1197,6 +1399,7 @@ class DetrModel(L.LightningModule):
                 edge_label,
                 edge_mask,
             )
+
         elif "stage mask" in self.stage:
 
             pixel_values, stage_2_embeds, pixel_mask = batch
@@ -1208,12 +1411,33 @@ class DetrModel(L.LightningModule):
         # logs metrics for each training_step, and the average across the epoch
         self.log("training_loss", loss, prog_bar=True)
         for k, v in loss_dict.items():
-            self.log("train_" + k, v.item(), prog_bar=True)
+            self.log("train_" + k, v.item(), prog_bar=False)
 
         return loss
 
-    def validation_step(self, batch, batch_idx, dataloader_idx=0):
-        if "stage 1" in self.stage:
+    def validation_step(self, batch, batch_idx=0, loader_idx=0):
+        # print(batch)
+
+        if "stage 1 + 2" in self.stage:
+            loss, loss_dict, output = self._common_step_stage1(batch[0], 0, None, True)
+            retdict = utils.process(output, batch[0]["labels"])
+            data2 = utils.convertStage2Dataset(retdict)
+            self.stage = "stage 2"
+            x = data2.x
+            y = data2.y
+            edge_index = data2.edge_index
+            mask = torch.ones_like(y, dtype=torch.bool)
+            boxes = data2.boxes if hasattr(data2, "boxes") else None
+            edge_label = data2.edge_label if hasattr(batch, "edge_label") else None
+            # edge_label = None
+            box_masks = data2.box_masks if hasattr(data2, "box_masks") else None
+            loss2, loss_dict2 = self.common_step_stage2(
+                x, edge_index, mask, y, boxes, box_masks, edge_label
+            )
+            self.stage = "stage 1 + 2"
+            loss = loss + loss2
+            loss_dict = loss_dict2
+        elif "stage 1" in self.stage:
             loss, loss_dict = self.common_step_stage1(batch)
         elif "stage 2" in self.stage:
             mask = batch.val_mask
@@ -1242,9 +1466,9 @@ class DetrModel(L.LightningModule):
         for k, v in loss_dict.items():
             res[k] = v.detach().cpu()
         self.val_step_outputs.append(res)
-        self.log("validation_loss", loss)
+        self.log("validation_loss", res["loss"])
         for k, v in loss_dict.items():
-            self.log("validate_" + k, v.item(), prog_bar=True)
+            self.log("validate_" + k, v.item(), prog_bar=False)
 
         return loss
 
@@ -1321,7 +1545,7 @@ class DetrModel(L.LightningModule):
         if self.scheduler_step > 0:
             return [optim], [
                 {
-                    "scheduler": WarmupScheduler(optim, 20),
+                    "scheduler": WarmupScheduler(optim, self.warmup_epoches),
                     "interval": "epoch",
                     "frequency": 1,
                 },
@@ -1334,15 +1558,15 @@ class DetrModel(L.LightningModule):
                 },
             ]
 
-            {
-                "optimizer": optim,
-                "lr_scheduler": {
-                    "scheduler": torch.optim.lr_scheduler.StepLR(
-                        optim, step_size=self.scheduler_step, gamma=0.5
-                    ),
-                    "interval": "epoch",
-                },
-            }
+            # return {
+            #     "optimizer": optim,
+            #     "lr_scheduler": {
+            #         "scheduler": torch.optim.lr_scheduler.StepLR(
+            #             optim, step_size=self.scheduler_step, gamma=0.5
+            #         ),
+            #         "interval": "epoch",
+            #     },
+            # }
         else:
             return optim
 
@@ -1455,20 +1679,36 @@ class Detr(L.LightningModule):
 
 
 class EMDataModule(L.LightningDataModule):
-    def __init__(self, trainsets, valsets, train_batch_size, val_batch_size):
+    def __init__(
+        self, trainsets, valsets, train_batch_size, val_batch_size, stack_batch=True
+    ):
         super().__init__()
         self.train_batch_size = train_batch_size
         self.val_batch_size = val_batch_size
         self.trainset = trainsets
         self.valset = valsets
+        if stack_batch:
+            self.stack_batch = utils.stackBatch
+        else:
+            self.stack_batch = utils.identicalMapping
 
     def train_dataloader(self):
+
+        if not isinstance(self.trainset, dict):
+            return torch.utils.data.DataLoader(
+                dataset=self.trainset,
+                collate_fn=self.stack_batch,
+                batch_size=self.train_batch_size,
+                shuffle=True,
+                num_workers=4,
+            )
+
         train_sets = []
         for i in self.trainset:
             train_sets.append(
                 torch.utils.data.DataLoader(
                     dataset=self.trainset[i],
-                    collate_fn=utils.stackBatch,
+                    collate_fn=self.stack_batch,
                     batch_size=self.train_batch_size,
                     shuffle=True,
                     num_workers=4,
@@ -1480,12 +1720,22 @@ class EMDataModule(L.LightningDataModule):
         )
 
     def val_dataloader(self):
+
+        if not isinstance(self.valset, dict):
+            return torch.utils.data.DataLoader(
+                dataset=self.valset,
+                collate_fn=self.stack_batch,
+                batch_size=self.val_batch_size,
+                shuffle=False,
+                num_workers=4,
+            )
+
         val_sets = []
         for i in self.valset:
             val_sets.append(
                 torch.utils.data.DataLoader(
                     dataset=self.valset[i],
-                    collate_fn=utils.stackBatch,
+                    collate_fn=self.stack_batch,
                     batch_size=self.val_batch_size,
                     shuffle=False,
                     num_workers=4,
@@ -1594,12 +1844,6 @@ class _Detr(L.LightningModule):
 
         return optimizer
 
-    def train_dataloader(self):
-        return train_dataloader
-
-    def val_dataloader(self):
-        return val_dataloader
-
 
 import torch
 import torch.nn.functional as F
@@ -1613,9 +1857,45 @@ from torch_geometric.nn import (
 )
 
 
-class GCN(torch.nn.Module):
-    def __init__(self, input_dim, output_classes, layer_type="GCNConv", dropout=True):
+class SimpleLinear(nn.Module):
+    def __init__(self, in_dim, out_dim):
+        super(SimpleLinear, self).__init__()
+        self.linear = nn.Linear(in_dim, out_dim)
+
+    def forward(self, x, edge):
+        return self.linear(x)
+
+
+class LoRALayer(torch.nn.Module):
+    def __init__(self, in_dim, out_dim, rank, dtype=torch.float):
         super().__init__()
+        std_dev = 1 / torch.sqrt(torch.tensor(rank).to(dtype))
+        self.A = torch.nn.Parameter(torch.randn(in_dim, rank, dtype=dtype) * std_dev)
+        self.B = torch.nn.Parameter(torch.zeros(rank, out_dim, dtype=dtype) * std_dev)
+        # self.C = torch.nn.Parameter(torch.zeros(out_dim, dtype=dtype) * std_dev)
+        # self.alpha = alpha
+
+    def forward(self, x):
+        x = x @ self.A @ self.B  # + self.C
+        # print(x.shape)
+        # x = x + self.C
+        return x
+
+
+class GCN(torch.nn.Module):
+    def __init__(
+        self,
+        input_dim,
+        additional_input_dim,
+        output_classes,
+        layer_type="GCNConv",
+        dropout=False,
+    ):
+
+        super().__init__()
+        self.output_classes = output_classes
+        self.additional_input_dim = additional_input_dim
+        self.additional_input_layer = AdditionalInputLayer(additional_input_dim, 16)
         if layer_type == "GCNConv":
             Layer = GCNConv
         elif layer_type == "SAGEConv":
@@ -1628,6 +1908,8 @@ class GCN(torch.nn.Module):
             Layer = GATv2Conv
         elif layer_type == "TransformerConv":
             Layer = TransformerConv
+        elif layer_type == "SimpleLinear":
+            Layer = SimpleLinear
         else:
             raise ValueError("Invalid layer type")
         self.conv1 = Layer(input_dim, input_dim)
@@ -1636,43 +1918,59 @@ class GCN(torch.nn.Module):
 
         self.cls_head = nn.Sequential(
             nn.Linear(input_dim, input_dim // 2),
-            nn.ReLU6(),
+            nn.ReLU(),
             nn.Linear(input_dim // 2, output_classes),
         )
-
+        # self.cls_head = nn.Sequential(
+        #     nn.Linear(input_dim, input_dim // 2),
+        #     nn.ReLU(),
+        #     LoRALayer(input_dim // 2, output_classes, 4),
+        # )
         self.box_head = nn.Sequential(
             nn.Linear(input_dim, input_dim // 2),
-            nn.ReLU6(),
-            nn.Linear(input_dim // 2, 4),
-            nn.Sigmoid(),
+            nn.ReLU(),
+            LoRALayer(input_dim // 2, 4, 4),
+            nn.Tanh(),
         )
 
         self.dropout = dropout
 
         self.edge_head = nn.Sequential(
             nn.Linear(input_dim * 2, input_dim),
-            nn.ReLU6(),
+            nn.ReLU(),
             nn.Linear(input_dim, input_dim // 2),
-            nn.ReLU6(),
+            nn.ReLU(),
             nn.Linear(input_dim // 2, 1),
             nn.Sigmoid(),
         )
 
-    def forward(self, x, edge_index):
+    def forward(self, inputs, edge_index):
 
-        x = self.conv1(x, edge_index)
-        x = F.relu6(x)
+        additional_input, model_feature = (
+            inputs[:, : self.additional_input_dim],
+            inputs[:, self.additional_input_dim :],
+        )
+
+        additional_feature = self.additional_input_layer(additional_input)
         if self.dropout:
-            x = F.dropout(x, p=0.2)
+            model_feature = F.dropout(model_feature, p=0.2)
+        x = torch.cat([model_feature, additional_feature], dim=1)
+
+        # x = self.conv1(x, edge_index)
+        # x = F.relu(x)
+        # if self.dropout:
+        #     x = F.dropout(x, p=0.2)
         x = self.conv2(x, edge_index)
 
-        x = F.relu6(x)
+        x = F.relu(x)
         if self.dropout:
             x = F.dropout(x, p=0.2)
         x = self.conv3(x, edge_index)
 
         predict = self.cls_head(x)
-        box = self.box_head(x)
+        # predict[:, : self.output_classes - 1] += inputs[:, 5 : self.output_classes + 4]
+
+        box = self.box_head(x) + inputs[:, 1:5]
 
         row, col = edge_index
         edge_embeddings = torch.cat([x[row], x[col]], dim=1)

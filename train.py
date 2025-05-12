@@ -65,8 +65,9 @@ def run():
     print("loading dataset")
     # CHECKPOINT = "facebook/detr-resnet-50"
     # image_processor = DetrImageProcessor.from_pretrained(CHECKPOINT)
-
-    if configs["model"]["stage"] == "stage 1":
+    if configs["model"]["stage"] == "stage 1 + 2":
+        ds = utils.get_stage12_dataset(configs)
+    elif configs["model"]["stage"] == "stage 1":
         ds = utils.get_stage1_dataset(configs)
     elif configs["model"]["stage"] == "stage 2":
         ds = utils.get_stage2_dataset(configs)
@@ -93,7 +94,7 @@ def run():
     monitor = (
         "total_validate_loss"
         if configs["model"]["stage"] != "stage 2"
-        else "validate_acc"
+        else "validate_auroc"
     )
 
     if configs["model"]["stage"] == "stage mask":
@@ -104,10 +105,13 @@ def run():
     filename = (
         "{epoch}-{total_validate_loss:.4f}"
         if configs["model"]["stage"] != "stage 2"
-        else "{epoch}-{validate_loss:.4f}-{validate_acc:.4f}"
+        else "{epoch}-{validate_loss:.4f}-{validate_auroc:.4f}"
     )
     if configs["model"]["stage"] == "stage mask":
         filename = "{epoch}-{total_validate_auroc:.4f}"
+
+    if configs["model"]["stage"] == "stage 1 + 2":
+        filename = "{epoch}-{total_validate_auroc:.4f}-{total_validate_loss:.4f}"
 
     # p = os.path.join(args.path, "a.txt")
     # f = open(p, "w")
@@ -127,7 +131,7 @@ def run():
     )
 
     checkpoint_callback2 = ModelCheckpoint(
-        every_n_epochs=8,
+        every_n_epochs=10,
         save_top_k=-1,
         save_last=False,  # Save the last checkpoint at the end of training
         dirpath=args.path,  # Directory where the checkpoints will be saved
@@ -142,6 +146,7 @@ def run():
         if "logger_path" in configs["training"]
         else "tb_logs"
     )
+
     name = (
         configs["training"]["name"]
         if "name" in configs["training"]
@@ -158,6 +163,7 @@ def run():
         accumulate_grad_batches=configs["training"]["accumulate_grad_batches"],
         log_every_n_steps=configs["training"]["log_every_n_steps"],
         callbacks=[checkpoint_callback, checkpoint_callback2],
+        strategy=args.strategy,
     )
 
     print("start training")
