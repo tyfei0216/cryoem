@@ -90,7 +90,7 @@ def transformImage(image):
     return image
 
 
-def drawannotation(image, target, box=True, mask=True):
+def drawannotation(image, target, box=True, mask=True, font_size=30):
     import matplotlib.pyplot as plt
     from torchvision.utils import draw_bounding_boxes, draw_segmentation_masks
 
@@ -118,7 +118,7 @@ def drawannotation(image, target, box=True, mask=True):
             image=annotated_tensor,
             boxes=target["bboxes"],
             labels=target["names"] if "names" in target else target["labels"],
-            font_size=30,
+            font_size=font_size,
             width=5,
             # colors=[int_colors[i] for i in [class_names.index(label) for label in labels]]
         )
@@ -564,7 +564,7 @@ def processSingle(model, label, data, target_size, thres, has_none, empty=5):
         reserve = reserve > thres
         reserve = reserve.any(dim=1)
 
-    if label is not None:
+    if label["class_labels"] is not None:
         o = {}
         o["pred_boxes"] = pred_boxes.unsqueeze(0)
         o["logits"] = logits.unsqueeze(0)
@@ -603,7 +603,7 @@ def processSingle(model, label, data, target_size, thres, has_none, empty=5):
     boxes = torch.zeros((pred_boxes.shape[0], 4))
     item_id = ["" for i in range(pred_boxes.shape[0])]
 
-    if label is not None:
+    if label["class_labels"] is not None:
         if len(label["class_labels"]) > 0:
             o = {}
             o["pred_boxes"] = pred_boxes.unsqueeze(0)
@@ -700,7 +700,10 @@ def buildStage2(
     ret_dict["label"] = torch.cat(ret_dict["label"], dim=0)
     ret_dict["box_mask"] = torch.cat(ret_dict["box_mask"], dim=0)
     ret_dict["boxes"] = torch.cat(ret_dict["boxes"], dim=0)
-    ret_dict["masks"] = torch.cat(ret_dict["masks"], dim=0)
+    if len(ret_dict["masks"]) > 0:
+        ret_dict["masks"] = torch.cat(ret_dict["masks"], dim=0)
+    # else:
+    #     ret_dict["masks"] = None
     item_ids = []
     for i in ret_dict["item_id"]:
         item_ids.extend(i)
@@ -710,18 +713,21 @@ def buildStage2(
     # return ret, l
 
 
-def process(outputs, labels, empty=5):
+def process(outputs, labels, empty=5, need_mask = False):
     ret = []
     boxeses = []
     box_masks = []
     l = []
     item_ids = []
+    mask = []
     logits = outputs["logits"]
     device = logits.device
     slice_num, num_obj, _ = logits.shape
     pred_boxes = outputs["pred_boxes"]
 
     match_res = matcher(outputs, labels)
+    
+    cnts = 0
     for i in range(slice_num):
         label = labels[i]
         pos = torch.zeros((num_obj, 5)).to(device)
@@ -740,8 +746,14 @@ def process(outputs, labels, empty=5):
         targets = torch.zeros((num_obj), dtype=torch.long).to(device)
         targets.fill_(empty)
         targets[match_res[i][0]] = label["class_labels"][match_res[i][1]]
-        box_mask = torch.zeros((num_obj), dtype=torch.bool).to(device)
-        box_mask[match_res[i][0]] = True
+        box_mask = torch.zeros((num_obj), dtype=torch.long).to(device)
+        box_mask.fill_(-1)
+        if len(match_res[i][0]) > 0:
+            t = torch.range(0, len(match_res[i][0])-1).long().to(device)
+            box_mask[match_res[i][0]] = t+cnts 
+            cnts += len(match_res[i][0])
+        if need_mask and "masks" in label:
+            mask.append(label["masks"][match_res[i][1]])
         boxes = torch.zeros((num_obj, 4)).to(device)
         boxes[match_res[i][0]] = label["boxes"][match_res[i][1]]
 
@@ -759,6 +771,17 @@ def process(outputs, labels, empty=5):
     box_masks = torch.cat(box_masks, dim=0)
     boxeses = torch.cat(boxeses, dim=0)
     item_ids = [i for j in item_ids for i in j]
+    if need_mask:
+        mask = torch.cat(mask, dim=0)
+        # print(cnts, mask.shape)
+        return {
+            "feature": ret,
+            "label": l,
+            "box_mask": box_masks,
+            "boxes": boxeses,
+            "item_id": item_ids,
+            "masks": mask,
+        }
     return {
         "feature": ret,
         "label": l,
@@ -774,12 +797,20 @@ from transformers.image_transforms import center_to_corners_format
 
 import modules
 
-
-def get_neighbors(X, z_thres1=0.03, z_thres2=0.25, iou_thres=0.6):
+def get_iou(X):
     iou, _ = modules.box_iou(
-        center_to_corners_format(X[:, 1:5]), center_to_corners_format(X[:, 1:5])
+        center_to_corners_format(torch.tensor(X)), center_to_corners_format(torch.tensor(X))
     )
-    x, y = torch.where(iou > 0.2)
+    iou = iou.numpy()
+    return iou
+
+def get_neighbors(X, z_thres1=0.03, z_thres2=0.5, iou_thres=0.4):
+    X2 = X[:, 1:5].clone()
+    X2[:, 3:] += 0.05
+    iou, _ = modules.box_iou(
+        center_to_corners_format(X2), center_to_corners_format(X2)
+    )
+    x, y = torch.where(iou > 0.01)
     zposx = X[:, 0][x]
     zposy = X[:, 0][y]
     x = x[torch.abs(zposx - zposy) < z_thres1]
@@ -829,7 +860,7 @@ def get_neighbors(X, z_thres1=0.03, z_thres2=0.25, iou_thres=0.6):
     # return xs, ys
 
 
-def convertStage2Dataset(retdict, z_thres1=0.01, z_thres2=0.2, iou_thres=0.6):
+def convertStage2Dataset(retdict, z_thres1=0.01, z_thres2=0.2, iou_thres=0.4):
     X = retdict["feature"]
 
     # print("building up neighboring graph")
