@@ -493,6 +493,9 @@ def getModel(configs):
     if "warmup_epoches" not in configs["training"]:
         configs["training"]["warmup_epoches"] = 0
 
+    if "pick_num" not in configs["training"]:
+        configs["training"]["pick_num"] = 6
+
     model = modules.DetrModel(
         configs["model"]["stage"],
         models,
@@ -508,6 +511,7 @@ def getModel(configs):
         scheduler_step=configs["training"]["scheduler_step"],
         warmup_epoches=configs["training"]["warmup_epoches"],
         mask_model=configs["model"]["mask_model"],
+        pick_num=configs["training"]["pick_num"],
     )
     if "load" in configs["model"] and configs["model"]["load"] is not None:
         t = torch.load(configs["model"]["load"], map_location="cpu")

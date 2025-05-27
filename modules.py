@@ -971,6 +971,16 @@ class AdditionalInputLayer(nn.Module):
         return x
 
 
+class EmptyContextManager:
+    def __enter__(self):
+        # No setup actions needed
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        # No cleanup actions needed
+        pass
+
+
 from torch import Tensor
 
 
@@ -1153,6 +1163,7 @@ class DetrModel(L.LightningModule):
         scheduler_step=-1,
         warmup_epoches=1,
         mask_model="Unet5",
+        pick_num=6,
     ):
         super().__init__()
         if isinstance(model, dict):
@@ -1209,7 +1220,7 @@ class DetrModel(L.LightningModule):
 
         self.scheduler_step = scheduler_step
 
-        self.num = 6
+        self.num = pick_num
 
     def forward(
         self,
@@ -1509,51 +1520,63 @@ class DetrModel(L.LightningModule):
         if "stage 1 + 2 + 3" in self.stage:
             temp = self.stage
             n, _, _, _ = batch[0]["pixel_values"].shape
-            # print("stage 1")
-            loss, loss_dict, output = self._common_step_stage1(batch[0], 0, None, True)
-            # print("stage 2")
-            retdict = utils.process(output, batch[0]["labels"], need_mask=True)
-            data2 = utils.convertStage2Dataset(retdict)
-            self.stage = "stage 2"
-            x = data2.x
-            y = data2.y
-            edge_index = data2.edge_index
-            mask = torch.ones_like(y, dtype=torch.bool)
-            boxes = data2.boxes  # if hasattr(data2, "boxes") else None
-            box_masks = data2.box_masks  # if hasattr(data2, "box_masks") else None
-            # if box_masks is not None:
-            #     box_masks = box_masks>-1
-            edge_label = data2.edge_label  # if hasattr(batch, "edge_label") else None
-            # edge_label = None
-            # if edge_label is None:
-            #     print("edge_label is None")
-            loss2, loss_dict2, outputs = self.common_step_stage2(
-                x,
-                edge_index,
-                mask,
-                y,
-                boxes,
-                box_masks > -1,
-                edge_label,
-                return_outputs=True,
-            )
-            loss += loss2
-            self.stage = "stage mask"
 
-            img = batch[0]["pixel_values"][n // 2]
-            embeds = outputs["embeddings"]
-            objects, _ = embeds.shape
-            obj_per_image = objects // n
-            masks = []
-            stage_2_embeds = []
-            sub_embeds = embeds[(n // 2) * obj_per_image : (n // 2 + 1) * obj_per_image]
-            sub_box_masks = box_masks[
-                (n // 2) * obj_per_image : (n // 2 + 1) * obj_per_image
-            ]
-            # y = data2.y
-            # y = y[(n // 2) * obj_per_image : (n // 2 + 1) * obj_per_image]
-            # t = retdict["masks"]
-            pick_from = torch.where((sub_box_masks > -1))[0]
+            t = torch.no_grad
+            if self.lr_detr > 0.0000001:
+                t = EmptyContextManager()
+            # print("stage 1")
+            with t():
+                loss, loss_dict, output = self._common_step_stage1(
+                    batch[0], 0, None, True
+                )
+                # print("stage 2")
+                retdict = utils.process(output, batch[0]["labels"], need_mask=True)
+                data2 = utils.convertStage2Dataset(retdict)
+                self.stage = "stage 2"
+                x = data2.x
+                y = data2.y
+                edge_index = data2.edge_index
+                mask = torch.ones_like(y, dtype=torch.bool)
+                boxes = data2.boxes  # if hasattr(data2, "boxes") else None
+                box_masks = data2.box_masks  # if hasattr(data2, "box_masks") else None
+                # if box_masks is not None:
+                #     box_masks = box_masks>-1
+                edge_label = (
+                    data2.edge_label
+                )  # if hasattr(batch, "edge_label") else None
+                # edge_label = None
+                # if edge_label is None:
+                #     print("edge_label is None")
+                loss2, loss_dict2, outputs = self.common_step_stage2(
+                    x,
+                    edge_index,
+                    mask,
+                    y,
+                    boxes,
+                    box_masks > -1,
+                    edge_label,
+                    return_outputs=True,
+                )
+                loss += loss2
+                self.stage = "stage mask"
+
+                img = batch[0]["pixel_values"][n // 2]
+                embeds = outputs["embeddings"]
+                objects, _ = embeds.shape
+                obj_per_image = objects // n
+                masks = []
+                stage_2_embeds = []
+                sub_embeds = embeds[
+                    (n // 2) * obj_per_image : (n // 2 + 1) * obj_per_image
+                ]
+                sub_box_masks = box_masks[
+                    (n // 2) * obj_per_image : (n // 2 + 1) * obj_per_image
+                ]
+                # y = data2.y
+                # y = y[(n // 2) * obj_per_image : (n // 2 + 1) * obj_per_image]
+                # t = retdict["masks"]
+                pick_from = torch.where((sub_box_masks > -1))[0]
+
             if len(pick_from) > 0:
                 if len(pick_from) <= self.num:
                     stage_2_embeds = sub_embeds[pick_from]
@@ -1674,48 +1697,61 @@ class DetrModel(L.LightningModule):
         if "stage 1 + 2 + 3" in self.stage:
             temp = self.stage
             n, _, _, _ = batch[0]["pixel_values"].shape
-            loss, loss_dict, output = self._common_step_stage1(batch[0], 0, None, True)
 
-            retdict = utils.process(output, batch[0]["labels"], need_mask=True)
-            data2 = utils.convertStage2Dataset(retdict)
-            self.stage = "stage 2"
-            x = data2.x
-            y = data2.y
-            edge_index = data2.edge_index
-            mask = torch.ones_like(y, dtype=torch.bool)
-            boxes = data2.boxes  # if hasattr(data2, "boxes") else None
-            box_masks = data2.box_masks  # if hasattr(data2, "box_masks") else None
-            # if box_masks is not None:
-            #     box_masks = box_masks>-1
-            edge_label = data2.edge_label  # if hasattr(batch, "edge_label") else None
-            # edge_label = None
-            # if edge_label is None:
-            #     print("edge_label is None")
-            loss2, loss_dict2, outputs = self.common_step_stage2(
-                x,
-                edge_index,
-                mask,
-                y,
-                boxes,
-                box_masks > -1,
-                edge_label,
-                return_outputs=True,
-            )
-            loss += loss2
-            self.stage = "stage mask"
-            img = batch[0]["pixel_values"][n // 2]
-            embeds = outputs["embeddings"]
-            objects, _ = embeds.shape
-            obj_per_image = objects // n
-            masks = []
-            stage_2_embeds = []
-            sub_embeds = embeds[(n // 2) * obj_per_image : (n // 2 + 1) * obj_per_image]
-            sub_box_masks = box_masks[
-                (n // 2) * obj_per_image : (n // 2 + 1) * obj_per_image
-            ]
-            # y = data2.y
-            # y = y[(n // 2) * obj_per_image : (n // 2 + 1) * obj_per_image]
-            pick_from = torch.where((sub_box_masks > -1))[0]
+            t = torch.no_grad
+            if self.lr_detr > 0.0000001:
+                t = EmptyContextManager()
+
+            with t():
+                loss, loss_dict, output = self._common_step_stage1(
+                    batch[0], 0, None, True
+                )
+
+                retdict = utils.process(output, batch[0]["labels"], need_mask=True)
+                data2 = utils.convertStage2Dataset(retdict)
+                self.stage = "stage 2"
+                x = data2.x
+                y = data2.y
+                edge_index = data2.edge_index
+                mask = torch.ones_like(y, dtype=torch.bool)
+                boxes = data2.boxes  # if hasattr(data2, "boxes") else None
+                box_masks = data2.box_masks  # if hasattr(data2, "box_masks") else None
+                # if box_masks is not None:
+                #     box_masks = box_masks>-1
+                edge_label = (
+                    data2.edge_label
+                )  # if hasattr(batch, "edge_label") else None
+                # edge_label = None
+                # if edge_label is None:
+                #     print("edge_label is None")
+                loss2, loss_dict2, outputs = self.common_step_stage2(
+                    x,
+                    edge_index,
+                    mask,
+                    y,
+                    boxes,
+                    box_masks > -1,
+                    edge_label,
+                    return_outputs=True,
+                )
+                loss += loss2
+                self.stage = "stage mask"
+                img = batch[0]["pixel_values"][n // 2]
+                embeds = outputs["embeddings"]
+                objects, _ = embeds.shape
+                obj_per_image = objects // n
+                masks = []
+                stage_2_embeds = []
+                sub_embeds = embeds[
+                    (n // 2) * obj_per_image : (n // 2 + 1) * obj_per_image
+                ]
+                sub_box_masks = box_masks[
+                    (n // 2) * obj_per_image : (n // 2 + 1) * obj_per_image
+                ]
+                # y = data2.y
+                # y = y[(n // 2) * obj_per_image : (n // 2 + 1) * obj_per_image]
+                pick_from = torch.where((sub_box_masks > -1))[0]
+
             if len(pick_from) > 0:
                 if len(pick_from) <= self.num:
                     stage_2_embeds = sub_embeds[pick_from]
@@ -1842,12 +1878,15 @@ class DetrModel(L.LightningModule):
                     "lr": self.lr,
                     "weight_decay": self.weight_decay,
                 },
-                {
-                    "params": d2,
-                    "lr": self.lr_detr,
-                    "weight_decay": self.weight_decay * 0.01,
-                },
             ]
+            if self.lr_detr > 0.0000001:
+                param_dicts.append(
+                    {
+                        "params": d2,
+                        "lr": self.lr_detr,
+                        "weight_decay": self.weight_decay * 0.01,
+                    },
+                )
             optim = torch.optim.AdamW(param_dicts)
 
         elif "stage 1" in self.stage:
