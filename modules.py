@@ -2,6 +2,7 @@ import json
 import os
 import pickle
 import random
+import threading
 import time
 from collections import defaultdict
 
@@ -579,7 +580,9 @@ class CocoDetection(torchvision.datasets.vision.VisionDataset):
         self.filtermin = filtermin
         self._filterIds()
 
-        self.seed = None
+        # self.seed = None
+
+        self.lock = threading.Lock()
         # self.zpos = []
 
     def _load_image(self, id: int):
@@ -701,7 +704,7 @@ class CocoDetection(torchvision.datasets.vision.VisionDataset):
 
         return image, target
 
-    def __getitem__(self, idx):
+    def __getitem__(self, idx, seed=None):
         # idx1 = idx
         # print("call item")
         if self.needids is not None:
@@ -725,11 +728,15 @@ class CocoDetection(torchvision.datasets.vision.VisionDataset):
             range(len(target["class_labels"])), dtype=torch.long
         )
 
-        if self.seed is not None:
-            L.seed_everything(self.seed, verbose=False)
+        if seed is not None:
+            with self.lock:
+                L.seed_everything(seed, verbose=False)
+                if self.transform is not None:
+                    image, target = self.transform(image, target)
+        else:
 
-        if self.transform is not None:
-            image, target = self.transform(image, target)
+            if self.transform is not None:
+                image, target = self.transform(image, target)
 
         c, h, w = image.shape
         target["orig_size"] = torch.tensor((h, w))
@@ -817,16 +824,14 @@ class CocoDetection2(CocoDetection):
         return super().__len__() - self.num + 1
 
     def __getitem__(self, idx):
-        # could cause choas between different workers, but doesn't matter
-        self.seed = self.seed + 1
+        # could cause chaos between different workers, but doesn't matter
+        with self.lock:
+            self.seed = self.seed + 1
+            seed = self.seed
         res = []
         num = self.num
-        # t = torch.randint(0, 2, (1, )).item()
-        # if t == 1:
-        #     num = 6
         for i in range(num):
-            # torch.manual_seed(self.seed)
-            res.append(super().__getitem__(idx + i))
+            res.append(super().__getitem__(idx + i, seed))
         return utils.stackBatch(res)
 
 
@@ -1147,6 +1152,7 @@ class DetrModel(L.LightningModule):
         dropout=True,
         scheduler_step=-1,
         warmup_epoches=1,
+        mask_model="Unet5",
     ):
         super().__init__()
         if isinstance(model, dict):
@@ -1161,6 +1167,7 @@ class DetrModel(L.LightningModule):
             "stage 2",
             "stage 1 + 2",
             "stage 1 + 2 + 3",
+            "stage 1 + 2 + 3 mask",
             "stage mask",
         ]
         print("model at stage ", stage)
@@ -1198,9 +1205,11 @@ class DetrModel(L.LightningModule):
         t[-1] = 0.1
         self.cri = nn.CrossEntropyLoss(weight=t)
         self.output_dim = output_dim
-        self.mask_head = UNet(embed_dim=feature_dim, sigmoid=False)
+        self.mask_head = mask_models[mask_model](embed_dim=feature_dim, sigmoid=False)
 
         self.scheduler_step = scheduler_step
+
+        self.num = 6
 
     def forward(
         self,
@@ -1318,13 +1327,15 @@ class DetrModel(L.LightningModule):
             if mark is not None:
                 loss += outputs[mark].loss
                 if loss_dict is None:
-                    loss_dict = outputs[mark].loss_dict
+                    loss_dict = outputs[mark].loss_dict.detach().cpu()
                 else:
                     for i in loss_dict:
-                        loss_dict[i] += outputs[mark].loss_dict[i]
+                        loss_dict[i] += outputs[mark].loss_dict[i].detach().cpu()
             else:
                 loss = outputs.loss
                 loss_dict = outputs.loss_dict
+                for i in loss_dict:
+                    loss_dict[i] = loss_dict[i].detach().cpu()
             if return_outputs:
                 return loss, loss_dict, outputs
             return loss, loss_dict
@@ -1365,11 +1376,16 @@ class DetrModel(L.LightningModule):
         ret_dict = self(x=x, edge_index=edge)
         # print(ret_dict["predict"][mask].shape, y[mask].shape)
         # print(torch.max(y[mask]))
+
         loss = self.cri(ret_dict["predict"][mask], y[mask])
+        # self.auroc.update(ret_dict["predict"][mask].detach(), y[mask])
+        # print("before auroc")
         loss_dict = {
-            "loss": loss,
-            "auroc": self.auroc(ret_dict["predict"][mask].detach(), y[mask]),
+            "loss": loss.detach().cpu(),
+            "auroc": self.auroc(ret_dict["predict"][mask].detach(), y[mask]).cpu(),
         }
+        # print("after auroc")
+        self.auroc.reset()
 
         if box is not None:
             box_mask = box_mask.to(self.device)
@@ -1379,10 +1395,10 @@ class DetrModel(L.LightningModule):
                 ret_dict["box"][box_mask], box[box_mask], box_mask.sum()
             )
             loss += loss_boxes
-            loss_dict["loss_boxes"] = loss_boxes
+            loss_dict["loss_boxes"] = loss_boxes.detach().cpu()
         else:
             loss_boxes = 0
-
+        # print("before edge loss")
         if edge_label is not None:
             edge_label = edge_label.to(self.device)
             if edge_mask is None:
@@ -1391,7 +1407,8 @@ class DetrModel(L.LightningModule):
                 ret_dict["edge"].squeeze()[edge_mask], edge_label[edge_mask].float()
             )
             loss += loss_edge
-            loss_dict["loss_edge"] = loss_edge
+            loss_dict["loss_edge"] = loss_edge.detach().cpu()
+        # print("after edge loss")
 
         if return_outputs:
             return loss, loss_dict, ret_dict
@@ -1418,40 +1435,83 @@ class DetrModel(L.LightningModule):
         # print(mask.shape, outputs.shape)
         # print(outputs[0][:5])
         # print(mask[0][:5])
-        loss = sigmoid_focal_loss(outputs, mask.float())
+        # print("before focal loss")
+        loss = sigmoid_focal_loss(outputs, mask.float(), alpha=0.2)
+        # print("after focal loss")
         if cal_auroc:
             auroc = self.mask_auroc(
                 outputs.detach().view(-1).cpu(), mask.detach().view(-1).cpu()
-            )
-            return loss, {"loss": loss, "auroc": auroc}
+            ).cpu()
+            # self.mask_auroc.reset()
+            # torch.cuda.empty_cache()
+            return loss, {"loss": loss.detach().cpu(), "mask_auroc": auroc}
         # loss = F.binary_cross_entropy(outputs, mask.float())
-        return loss, {"loss": loss}
+        return loss, {"loss": loss.detach().cpu()}
 
     def on_validation_epoch_end(self):
         # loss = torch.stack(self.val_step_outputs).mean()
         losses = np.mean([i["loss"] for i in self.val_step_outputs])
-        if "stage mask" in self.stage:
-            auroc = np.mean([i["auroc"] for i in self.val_step_outputs])
-            self.log("total_validate_auroc", auroc)
-        if "stage 1 + 2" in self.stage:
+        if "stage mask" in self.stage or "stage 1 + 2 + 3" in self.stage:
+            # auroc = self.mask_auroc.compute()
+            auroc = np.nanmean(
+                [i["mask_auroc"] for i in self.val_step_outputs if "mask_auroc" in i]
+            )
+            self.log("total_validate_mask_auroc", auroc, prog_bar=True)
+            self.mask_auroc.reset()
+        if "stage 2" in self.stage or "stage 1 + 2" in self.stage:
+            # auroc = self.auroc.compute()
             auroc = np.mean([i["auroc"] for i in self.val_step_outputs])
             self.log("total_validate_auroc", auroc, prog_bar=True)
+            self.auroc.reset()
             loss_boxes = np.mean(
                 [i["loss_boxes"] for i in self.val_step_outputs if "loss_boxes" in i]
             )
             self.log("total_validate_loss_boxes", loss_boxes, prog_bar=True)
-        # loss = np.mean(self.val_step_outputs)
+
         self.log("total_validate_loss", losses, prog_bar=True)
         self.val_step_outputs.clear()
+
+    def on_train_epoch_end(self):
+        # loss = torch.stack(self.val_step_outputs).mean()
+        losses = np.mean([i["loss"] for i in self.training_step_outputs])
+        if "stage mask" in self.stage or "stage 1 + 2 + 3" in self.stage:
+            # auroc = self.mask_auroc.compute()
+            auroc = np.nanmean(
+                [
+                    i["mask_auroc"]
+                    for i in self.training_step_outputs
+                    if "mask_auroc" in i
+                ]
+            )
+            self.log("total_train_mask_auroc", auroc, prog_bar=True)
+            self.mask_auroc.reset()
+        if "stage 2" in self.stage or "stage 1 + 2" in self.stage:
+            # auroc = self.auroc.compute()
+            auroc = np.mean([i["auroc"] for i in self.training_step_outputs])
+            self.log("total_train_auroc", auroc, prog_bar=True)
+            self.auroc.reset()
+            loss_boxes = np.mean(
+                [
+                    i["loss_boxes"]
+                    for i in self.training_step_outputs
+                    if "loss_boxes" in i
+                ]
+            )
+            self.log("total_train_loss_boxes", loss_boxes, prog_bar=True)
+
+        self.log("total_train_loss", losses, prog_bar=True)
+        self.training_step_outputs.clear()
 
     def training_step(self, batch, batch_idx=0, loader_idx=0):
         # with open("./temp.pkl", "wb") as f:
         #     pickle.dump(batch, f)
         # print(batch)
         if "stage 1 + 2 + 3" in self.stage:
+            temp = self.stage
             n, _, _, _ = batch[0]["pixel_values"].shape
+            # print("stage 1")
             loss, loss_dict, output = self._common_step_stage1(batch[0], 0, None, True)
-
+            # print("stage 2")
             retdict = utils.process(output, batch[0]["labels"], need_mask=True)
             data2 = utils.convertStage2Dataset(retdict)
             self.stage = "stage 2"
@@ -1479,35 +1539,76 @@ class DetrModel(L.LightningModule):
             )
             loss += loss2
             self.stage = "stage mask"
-            if n <= 3:
-                embeds = outputs["embeddings"]
-                objects, _ = embeds.shape
-                obj_per_image = objects // n
-                masks = []
-                stage_2_embeds = []
-                for i in range(n):
-                    sub_box_masks = box_masks[
-                        i * obj_per_image : (i + 1) * obj_per_image
-                    ]
-                    sub_embeds = embeds[i * obj_per_image : (i + 1) * obj_per_image]
-                    pick_from = torch.where(sub_box_masks > -1)[0]
-                    if len(pick_from) > 0:
-                        random_index = torch.randint(0, len(pick_from), (1,)).item()
-                        pick_index = pick_from[random_index]
-                        stage_2_embeds.append(sub_embeds[pick_index])
-                        pick_index = sub_box_masks[pick_index]
-                        masks.append(retdict["masks"][pick_index])
-                    else:
-                        stage_2_embeds.append(torch.zeros_like(sub_embeds[0]))
-                        masks.append(torch.zeros_like(retdict["masks"][0]))
-                stage_2_embeds = torch.stack(stage_2_embeds)
-                masks = torch.stack(masks)
-                loss3, loss_dict3 = self.common_stage_mask(
-                    batch[0]["pixel_values"], stage_2_embeds, masks, True
-                )
-                loss += loss3
-                loss_dict2["mask_auroc"] = loss_dict3["auroc"]
-            self.stage = "stage 1 + 2 + 3"
+
+            img = batch[0]["pixel_values"][n // 2]
+            embeds = outputs["embeddings"]
+            objects, _ = embeds.shape
+            obj_per_image = objects // n
+            masks = []
+            stage_2_embeds = []
+            sub_embeds = embeds[(n // 2) * obj_per_image : (n // 2 + 1) * obj_per_image]
+            sub_box_masks = box_masks[
+                (n // 2) * obj_per_image : (n // 2 + 1) * obj_per_image
+            ]
+            # y = data2.y
+            # y = y[(n // 2) * obj_per_image : (n // 2 + 1) * obj_per_image]
+            # t = retdict["masks"]
+            pick_from = torch.where((sub_box_masks > -1))[0]
+            if len(pick_from) > 0:
+                if len(pick_from) <= self.num:
+                    stage_2_embeds = sub_embeds[pick_from]
+                    pick_index = sub_box_masks[pick_from]
+                    masks = retdict["masks"][pick_index]
+                else:
+                    tensor = torch.arange(len(pick_from))
+                    indices = torch.randperm(tensor.size(0))[: self.num]
+                    selected = pick_from[indices]
+                    stage_2_embeds = sub_embeds[selected]
+                    pick_index = sub_box_masks[selected]
+                    masks = retdict["masks"][pick_index]
+                num_masks = masks.sum(axis=[1, 2])
+                num_masks = num_masks > 0
+                if num_masks.sum() > 0:
+                    stage_2_embeds = stage_2_embeds[num_masks]
+                    masks = masks[num_masks]
+                    img = img[None, :, :, :].repeat(stage_2_embeds.shape[0], 1, 1, 1)
+                    loss3, loss_dict3 = self.common_stage_mask(
+                        img, stage_2_embeds, masks, True
+                    )
+                    loss += loss3
+                    loss_dict2["mask_auroc"] = loss_dict3["mask_auroc"]
+            else:
+                loss_dict2["mask_auroc"] = np.nan
+
+            # if n <= 3:
+            #     embeds = outputs["embeddings"]
+            #     objects, _ = embeds.shape
+            #     obj_per_image = objects // n
+            #     masks = []
+            #     stage_2_embeds = []
+            #     for i in range(n):
+            #         sub_box_masks = box_masks[
+            #             i * obj_per_image : (i + 1) * obj_per_image
+            #         ]
+            #         sub_embeds = embeds[i * obj_per_image : (i + 1) * obj_per_image]
+            #         pick_from = torch.where(sub_box_masks > -1)[0]
+            #         if len(pick_from) > 0:
+            #             random_index = torch.randint(0, len(pick_from), (1,)).item()
+            #             pick_index = pick_from[random_index]
+            #             stage_2_embeds.append(sub_embeds[pick_index])
+            #             pick_index = sub_box_masks[pick_index]
+            #             masks.append(retdict["masks"][pick_index])
+            #         else:
+            #             stage_2_embeds.append(torch.zeros_like(sub_embeds[0]))
+            #             masks.append(torch.zeros_like(retdict["masks"][0]))
+            #     stage_2_embeds = torch.stack(stage_2_embeds)
+            #     masks = torch.stack(masks)
+            #     loss3, loss_dict3 = self.common_stage_mask(
+            #         batch[0]["pixel_values"], stage_2_embeds, masks, True
+            #     )
+            #     loss += loss3
+            #     loss_dict2["mask_auroc"] = loss_dict3["auroc"]
+            self.stage = temp  # "stage 1 + 2 + 3"
             loss_dict = loss_dict2
             # loss_dict["auroc_mask"] = loss_dict3["auroc"]
         elif "stage 1 + 2" in self.stage:
@@ -1558,19 +1659,20 @@ class DetrModel(L.LightningModule):
             pixel_values, stage_2_embeds, pixel_mask = batch
             # print(pixel_mask)
             loss, loss_dict = self.common_stage_mask(
-                pixel_values, stage_2_embeds, pixel_mask
+                pixel_values, stage_2_embeds, pixel_mask, True
             )
 
         # logs metrics for each training_step, and the average across the epoch
         self.log("training_loss", loss, prog_bar=True)
-        for k, v in loss_dict.items():
-            self.log("train_" + k, v.item(), prog_bar=False)
-
+        # for k, v in loss_dict.items():
+        #     self.log("train_" + k, v.item(), prog_bar=False)
+        self.training_step_outputs.append(loss_dict)
         return loss
 
     def validation_step(self, batch, batch_idx=0, loader_idx=0):
         # print(batch)
         if "stage 1 + 2 + 3" in self.stage:
+            temp = self.stage
             n, _, _, _ = batch[0]["pixel_values"].shape
             loss, loss_dict, output = self._common_step_stage1(batch[0], 0, None, True)
 
@@ -1601,35 +1703,73 @@ class DetrModel(L.LightningModule):
             )
             loss += loss2
             self.stage = "stage mask"
-            if n <= 3:
-                embeds = outputs["embeddings"]
-                objects, _ = embeds.shape
-                obj_per_image = objects // n
-                masks = []
-                stage_2_embeds = []
-                for i in range(n):
-                    sub_box_masks = box_masks[
-                        i * obj_per_image : (i + 1) * obj_per_image
-                    ]
-                    sub_embeds = embeds[i * obj_per_image : (i + 1) * obj_per_image]
-                    pick_from = torch.where(sub_box_masks > -1)[0]
-                    if len(pick_from) > 0:
-                        random_index = torch.randint(0, len(pick_from), (1,)).item()
-                        pick_index = pick_from[random_index]
-                        stage_2_embeds.append(sub_embeds[pick_index])
-                        pick_index = sub_box_masks[pick_index]
-                        masks.append(retdict["masks"][pick_index])
-                    else:
-                        stage_2_embeds.append(torch.zeros_like(sub_embeds[0]))
-                        masks.append(torch.zeros_like(retdict["masks"][0]))
-                stage_2_embeds = torch.stack(stage_2_embeds)
-                masks = torch.stack(masks)
-                loss3, loss_dict3 = self.common_stage_mask(
-                    batch[0]["pixel_values"], stage_2_embeds, masks, True
-                )
-                loss += loss3
-                loss_dict2["mask_auroc"] = loss_dict3["auroc"]
-            self.stage = "stage 1 + 2 + 3"
+            img = batch[0]["pixel_values"][n // 2]
+            embeds = outputs["embeddings"]
+            objects, _ = embeds.shape
+            obj_per_image = objects // n
+            masks = []
+            stage_2_embeds = []
+            sub_embeds = embeds[(n // 2) * obj_per_image : (n // 2 + 1) * obj_per_image]
+            sub_box_masks = box_masks[
+                (n // 2) * obj_per_image : (n // 2 + 1) * obj_per_image
+            ]
+            # y = data2.y
+            # y = y[(n // 2) * obj_per_image : (n // 2 + 1) * obj_per_image]
+            pick_from = torch.where((sub_box_masks > -1))[0]
+            if len(pick_from) > 0:
+                if len(pick_from) <= self.num:
+                    stage_2_embeds = sub_embeds[pick_from]
+                    pick_index = sub_box_masks[pick_from]
+                    masks = retdict["masks"][pick_index]
+                else:
+                    tensor = torch.arange(len(pick_from))
+                    indices = torch.randperm(tensor.size(0))[: self.num]
+                    selected = pick_from[indices]
+                    stage_2_embeds = sub_embeds[selected]
+                    pick_index = sub_box_masks[selected]
+                    masks = retdict["masks"][pick_index]
+                num_masks = masks.sum(axis=[1, 2])
+                num_masks = num_masks > 0
+                if num_masks.sum() > 0:
+                    stage_2_embeds = stage_2_embeds[num_masks]
+                    masks = masks[num_masks]
+                    img = img[None, :, :, :].repeat(stage_2_embeds.shape[0], 1, 1, 1)
+                    loss3, loss_dict3 = self.common_stage_mask(
+                        img, stage_2_embeds, masks, True
+                    )
+                    loss += loss3
+                    loss_dict2["mask_auroc"] = loss_dict3["mask_auroc"]
+            else:
+                loss_dict2["mask_auroc"] = np.nan
+            # if n <= 3:
+            #     embeds = outputs["embeddings"]
+            #     objects, _ = embeds.shape
+            #     obj_per_image = objects // n
+            #     masks = []
+            #     stage_2_embeds = []
+            #     for i in range(n):
+            #         sub_box_masks = box_masks[
+            #             i * obj_per_image : (i + 1) * obj_per_image
+            #         ]
+            #         sub_embeds = embeds[i * obj_per_image : (i + 1) * obj_per_image]
+            #         pick_from = torch.where(sub_box_masks > -1)[0]
+            #         if len(pick_from) > 0:
+            #             random_index = torch.randint(0, len(pick_from), (1,)).item()
+            #             pick_index = pick_from[random_index]
+            #             stage_2_embeds.append(sub_embeds[pick_index])
+            #             pick_index = sub_box_masks[pick_index]
+            #             masks.append(retdict["masks"][pick_index])
+            #         else:
+            #             stage_2_embeds.append(torch.zeros_like(sub_embeds[0]))
+            #             masks.append(torch.zeros_like(retdict["masks"][0]))
+            #     stage_2_embeds = torch.stack(stage_2_embeds)
+            #     masks = torch.stack(masks)
+            #     loss3, loss_dict3 = self.common_stage_mask(
+            #         batch[0]["pixel_values"], stage_2_embeds, masks, True
+            #     )
+            #     loss += loss3
+            #     loss_dict2["mask_auroc"] = loss_dict3["auroc"]
+            self.stage = temp  # "stage 1 + 2 + 3"
             loss_dict = loss_dict2
         elif "stage 1 + 2" in self.stage:
             loss, loss_dict, output = self._common_step_stage1(batch[0], 0, None, True)
@@ -1679,15 +1819,38 @@ class DetrModel(L.LightningModule):
         for k, v in loss_dict.items():
             res[k] = v.detach().cpu()
         self.val_step_outputs.append(res)
-        self.log("validation_loss", res["loss"])
-        for k, v in loss_dict.items():
-            self.log("validate_" + k, v.item(), prog_bar=False)
+        self.log("validation_loss", res["loss"], prog_bar=True)
+        # for k, v in loss_dict.items():
+        #     self.log("validate_" + k, v.item(), prog_bar=False)
 
         return loss
 
     def configure_optimizers(self):
         optim = None
-        if "stage 1" in self.stage:
+        if "stage 1 + 2 + 3 mask" in self.stage:
+            d1 = []
+            d2 = []
+            for n, p in self.named_parameters():
+                if "mask_head" in n and p.requires_grad:
+                    d1.append(p)
+                elif p.requires_grad:
+                    d2.append(p)
+
+            param_dicts = [
+                {
+                    "params": d1,
+                    "lr": self.lr,
+                    "weight_decay": self.weight_decay,
+                },
+                {
+                    "params": d2,
+                    "lr": self.lr_detr,
+                    "weight_decay": self.weight_decay * 0.01,
+                },
+            ]
+            optim = torch.optim.AdamW(param_dicts)
+
+        elif "stage 1" in self.stage:
             if self.lr_backbone is not None:
 
                 d1 = []
@@ -1788,7 +1951,7 @@ class DetrModel(L.LightningModule):
         )
 
 
-# only used for pretraining
+# only used for pretraining now unused
 class Detr(L.LightningModule):
 
     def __init__(self, lr, weight_decay, model, lr_backbone=None):
@@ -2207,6 +2370,9 @@ class GCN(torch.nn.Module):
             x = F.dropout(x, p=0.2)
         x = self.conv3(x, edge_index)
 
+        # if self.dropout:
+        #     x = F.dropout(x, p=0.2)
+
         predict = self.cls_head(x)
         # predict[:, : self.output_classes - 1] += inputs[:, 5 : self.output_classes + 4]
 
@@ -2329,7 +2495,7 @@ class SelfAttention(nn.Module):
         self.channels = channels
         self.size = size
         self.mha = nn.MultiheadAttention(channels + pos_embed, 4, batch_first=True)
-        self.pos = nn.Parameter(torch.randn(1, size * size, pos_embed))
+        self.pos = nn.Parameter(torch.zeros(1, size * size, pos_embed))
         self.l1 = nn.Linear(channels + pos_embed, channels)
         self.ln = nn.LayerNorm([channels])
         self.ff_self = nn.Sequential(
@@ -2346,8 +2512,8 @@ class SelfAttention(nn.Module):
 
         attention_value, _ = self.mha(x_ln, x_ln, x_ln)
         attention_value = self.l1(attention_value)
-        attention_value = attention_value + x
-        attention_value = self.ff_self(attention_value) + attention_value
+        attention_value = attention_value  # + x
+        attention_value = self.ff_self(attention_value)  # + attention_value
         return attention_value.swapaxes(2, 1).view(
             -1, self.channels, self.size, self.size
         )
@@ -2371,7 +2537,7 @@ class DoubleConv(nn.Module):
         if self.residual:
             return F.gelu(x + self.double_conv(x))
         else:
-            return self.double_conv(x)
+            return F.gelu(self.double_conv(x))
 
 
 class Down(nn.Module):
@@ -2379,13 +2545,13 @@ class Down(nn.Module):
         super().__init__()
         self.maxpool_conv = nn.Sequential(
             nn.MaxPool2d(pool_kernal),
-            DoubleConv(in_channels, in_channels, residual=True),
+            # DoubleConv(in_channels, in_channels, residual=True),
             DoubleConv(in_channels, out_channels),
         )
 
         self.emb_layer = nn.Sequential(
-            nn.SiLU(),
             nn.Linear(emb_dim, out_channels),
+            nn.SiLU(),
         )
 
     def forward(self, x, t):
@@ -2395,32 +2561,220 @@ class Down(nn.Module):
 
 
 class Up(nn.Module):
-    def __init__(self, in_channels, out_channels, size, emb_dim=256):
+    def __init__(self, in_channels, out_channels, size, emb_dim=None):
         super().__init__()
 
         self.up = nn.Upsample(size=size, mode="bilinear", align_corners=True)
         self.conv = nn.Sequential(
-            DoubleConv(in_channels, in_channels, residual=True),
-            DoubleConv(in_channels, out_channels, in_channels // 2),
+            # DoubleConv(in_channels, in_channels, residual=True),
+            DoubleConv(in_channels, out_channels, in_channels),
         )
+        if emb_dim is not None:
+            self.emb_layer = nn.Sequential(
+                nn.Linear(emb_dim, out_channels),
+                nn.SiLU(),
+            )
 
-        self.emb_layer = nn.Sequential(
-            nn.SiLU(),
-            nn.Linear(emb_dim, out_channels),
-        )
-
-    def forward(self, x, skip_x, t):
+    def forward(self, x, skip_x, t=None):
         x = self.up(x)
+        # print("up", x.shape, skip_x.shape)
         x = torch.cat([skip_x, x], dim=1)
         x = self.conv(x)
+        if t is None:
+            return x
+
         emb = self.emb_layer(t)[:, :, None, None].repeat(1, 1, x.shape[-2], x.shape[-1])
         return x + emb
 
 
 class UNet(nn.Module):
+    def __init__(self, c_in=3, embed_dim=256, patch_size=8, sigmoid=True):
+        super().__init__()
+
+        self.inc = DoubleConv(3, 8, 8)
+
+        # 3 * 800 * 800
+        self.down1 = Down(8, 32, embed_dim, 2)
+
+        # 8 * 400 * 400
+        self.down2 = Down(32, 64, embed_dim, 2)
+
+        self.patch_embed = nn.Conv2d(
+            64, 1024, kernel_size=patch_size, stride=patch_size
+        )
+        self.pos_embed = nn.Parameter(torch.randn(1, 626, 1024))
+        self.l = nn.Sequential(nn.Linear(embed_dim, 1024), nn.SiLU())
+        self.transformer = nn.TransformerEncoder(
+            nn.TransformerEncoderLayer(
+                d_model=1024,
+                nhead=8,
+                dim_feedforward=1024,
+                dropout=0.1,
+                activation="gelu",
+            ),
+            num_layers=6,
+        )
+
+        # 64 * 200 * 200
+        self.up3 = Up(1024 + 64, 256, (200, 200), embed_dim)
+
+        # 32 * 800 * 800
+        self.up2 = Up(256 + 32, 64, (400, 400), embed_dim)
+
+        # 1 * 800 * 800
+        self.up1 = Up(64 + 8, 1, (800, 800))
+
+        self.sigmoid = sigmoid
+
+    def forward(self, x0, t):
+        B, C, _, _ = x0.shape
+        x0 = self.inc(x0)
+        x1 = self.down1(x0, t)
+        x2 = self.down2(x1, t)
+        s = self.l(t)
+        x3 = self.patch_embed(x2)
+        x3 = x3.flatten(2).transpose(1, 2)
+        x3 = torch.cat((s.unsqueeze(1), x3), dim=1)
+        x3 = x3 + self.pos_embed
+
+        x = self.transformer(x3)
+        x = x[:, 1:, :]
+        x = x.transpose(1, 2).reshape(B, -1, 25, 25)
+
+        x = self.up3(x, x2, t)
+        x = self.up2(x, x1, t)
+        x = self.up1(x, x0)
+
+        x = x.squeeze(1)
+        if self.sigmoid:
+            x = torch.sigmoid(x)
+        return x
+
+
+class UNet1(nn.Module):
+    def __init__(self, c_in=3, embed_dim=256, patch_size=8, sigmoid=True):
+        super().__init__()
+
+        self.inc = DoubleConv(3, 8, 8)
+
+        # 3 * 800 * 800
+        self.down1 = Down(8, 32, embed_dim, 2)
+
+        # 8 * 400 * 400
+        self.down2 = Down(32, 64, embed_dim, 2)
+
+        self.patch_embed = nn.Conv2d(
+            64, 1024, kernel_size=patch_size, stride=patch_size
+        )
+
+        self.sa1 = SelfAttention(1024, 25)
+        self.sa2 = SelfAttention(1024, 25)
+        self.sa3 = SelfAttention(1024, 25)
+        self.sa4 = SelfAttention(1024, 25)
+        self.sa5 = SelfAttention(1024, 25)
+        # self.pos_embed = nn.Parameter(torch.randn(1, 626, 1024))
+        # self.l = nn.Sequential(nn.Linear(embed_dim, 1024), nn.SiLU())
+        # self.transformer = nn.TransformerEncoder(
+        #     nn.TransformerEncoderLayer(
+        #         d_model=1024,
+        #         nhead=8,
+        #         dim_feedforward=1024,
+        #         dropout=0.1,
+        #         activation="gelu",
+        #     ),
+        #     num_layers=6,
+        # )
+
+        # 64 * 200 * 200
+        self.up3 = Up(1024 + 64, 256, (200, 200), embed_dim)
+
+        # 32 * 800 * 800
+        self.up2 = Up(256 + 32, 64, (400, 400), embed_dim)
+
+        # 1 * 800 * 800
+        self.up1 = Up(64 + 8, 1, (800, 800))
+
+        self.sigmoid = sigmoid
+
+    def forward(self, x0, t):
+        B, C, _, _ = x0.shape
+        x0 = self.inc(x0)
+        x1 = self.down1(x0, t)
+        x2 = self.down2(x1, t)
+        # s = self.l(t)
+        x3 = self.patch_embed(x2)
+        x = self.sa1(x3)
+        x = self.sa2(x)
+        x = self.sa3(x)
+        x = self.sa4(x)
+        x = self.sa5(x)
+        # x3 = x3.flatten(2).transpose(1, 2)
+        # x3 = torch.cat((s.unsqueeze(1), x3), dim=1)
+        # x3 = x3 + self.pos_embed
+
+        # x = self.transformer(x3)
+        # x = x[:, 1:, :]
+        # x = x.transpose(1, 2).reshape(B, -1, 25, 25)
+
+        x = self.up3(x, x2, t)
+        x = self.up2(x, x1, t)
+        x = self.up1(x, x0)
+
+        x = x.squeeze(1)
+        if self.sigmoid:
+            x = torch.sigmoid(x)
+        return x
+
+
+# class Down(nn.Module):
+#     def __init__(self, in_channels, out_channels, emb_dim=256, pool_kernal=2):
+#         super().__init__()
+#         self.maxpool_conv = nn.Sequential(
+#             nn.MaxPool2d(pool_kernal),
+#             DoubleConv(in_channels, in_channels, residual=True),
+#             DoubleConv(in_channels, out_channels),
+#         )
+
+#         self.emb_layer = nn.Sequential(
+#             nn.SiLU(),
+#             nn.Linear(emb_dim, out_channels),
+#         )
+
+#     def forward(self, x, t):
+#         x = self.maxpool_conv(x)
+#         emb = self.emb_layer(t)[:, :, None, None].repeat(1, 1, x.shape[-2], x.shape[-1])
+#         return x + emb
+
+
+# class Up(nn.Module):
+#     def __init__(self, in_channels, out_channels, size, emb_dim=256):
+#         super().__init__()
+
+#         self.up = nn.Upsample(size=size, mode="bilinear", align_corners=True)
+#         self.conv = nn.Sequential(
+#             DoubleConv(in_channels, in_channels, residual=True),
+#             DoubleConv(in_channels, out_channels, in_channels // 2),
+#         )
+
+#         self.emb_layer = nn.Sequential(
+#             nn.SiLU(),
+#             nn.Linear(emb_dim, out_channels),
+#         )
+
+#     def forward(self, x, skip_x, t=None):
+#         x = self.up(x)
+#         x = torch.cat([skip_x, x], dim=1)
+#         x = self.conv(x)
+#         if t is None:
+#             return x
+#         emb = self.emb_layer(t)[:, :, None, None].repeat(1, 1, x.shape[-2], x.shape[-1])
+#         return x + emb
+
+
+class UNet2(nn.Module):
     def __init__(self, c_in=3, c_out=1, embed_dim=272, sigmoid=True):
         super().__init__()
-        self.ini = DoubleConv()
+        # self.ini = DoubleConv()
 
         # 64 * 800 * 800
         self.inc = DoubleConv(c_in, 32)
@@ -2490,3 +2844,698 @@ class UNet(nn.Module):
         if self.sigmoid:
             output = torch.sigmoid(output)
         return output
+
+
+class UNet3(nn.Module):
+    def __init__(self, c_in=3, c_out=1, embed_dim=272, sigmoid=True):
+        super().__init__()
+        # self.ini = DoubleConv()
+
+        # 16 * 800 * 800
+        self.inc = DoubleConv(c_in, 16)
+
+        # 16 * 400 * 400
+        self.down1 = Down(16, 32, embed_dim)
+
+        # 64 * 200 * 200
+        self.down2 = Down(32, 64, embed_dim)
+
+        # 128 * 100 * 100
+        self.down3 = Down(64, 128, embed_dim)
+
+        # 256 * 50 * 50
+        self.down4 = Down(128, 128, embed_dim)
+        # effective patch size 16 * 16
+        self.sa1 = SelfAttention(128, 50)
+
+        # 256 * 25 * 25
+        self.down5 = Down(128, 256, embed_dim)
+        # effective patch size 32 * 32
+        self.sa2 = SelfAttention(256, 25)
+
+        # 256 * 12 * 12
+        self.down6 = Down(256, 256, embed_dim)
+        self.sa3 = SelfAttention(256, 12)
+
+        self.bot1 = DoubleConv(256, 512)
+        self.bot2 = DoubleConv(512, 512)
+        self.bot3 = DoubleConv(512, 256)
+
+        # 256 * 25 * 25
+        self.up1 = Up(512, 128, (25, 25), embed_dim)
+        self.sa4 = SelfAttention(128, 25)
+
+        # 128 * 50 * 50
+        self.up2 = Up(256, 128, (50, 50), embed_dim)
+        self.sa5 = SelfAttention(128, 50)
+
+        # 128 * 100 * 100
+        self.up3 = Up(256, 64, (100, 100), embed_dim)
+
+        # 64 * 200 * 200
+        self.up4 = Up(128, 32, (200, 200), embed_dim)
+
+        # 32 * 400 * 400
+        self.up5 = Up(64, 16, (400, 400), embed_dim)
+
+        # 32 * 800 * 800
+        self.up6 = Up(32, 32, (800, 800), embed_dim)
+
+        # 1 * 800 * 800
+        self.outc = nn.Conv2d(32, c_out, kernel_size=1)
+
+        self.sigmoid = sigmoid
+
+    def forward(self, x, t):
+
+        x1 = self.inc(x)
+        x2 = self.down1(x1, t)
+        x3 = self.down2(x2, t)
+        x4 = self.down3(x3, t)
+        x5 = self.down4(x4, t)
+        x5 = self.sa1(x5)
+
+        x6 = self.down5(x5, t)
+        x6 = self.sa2(x6)
+        x7 = self.down6(x6, t)
+        x7 = self.sa3(x7)
+
+        x7 = self.bot1(x7)
+        x7 = self.bot2(x7)
+        x7 = self.bot3(x7)
+
+        x = self.up1(x7, x6, t)
+        x = self.sa4(x)
+        x = self.up2(x, x5, t)
+        # print(x.shape)
+        x = self.sa5(x)
+        # print(x.shape, x4.shape)
+        x = self.up3(x, x4, t)
+        x = self.up4(x, x3, t)
+        x = self.up5(x, x2, t)
+        x = self.up6(x, x1, t)
+        output = self.outc(x).squeeze(1)
+        if self.sigmoid:
+            output = torch.sigmoid(output)
+        return output
+
+
+class UNet4(nn.Module):
+    def __init__(self, c_in=3, c_out=1, embed_dim=272, sigmoid=True):
+        super().__init__()
+        # self.ini = DoubleConv()
+
+        # 16 * 800 * 800
+        self.inc = DoubleConv(c_in, 16)
+
+        # 16 * 400 * 400
+        self.down1 = Down(16, 32, embed_dim)
+
+        # 64 * 200 * 200
+        self.down2 = Down(32, 64, embed_dim)
+
+        # 128 * 100 * 100
+        self.down3 = Down(64, 128, embed_dim)
+
+        # 256 * 50 * 50
+        self.down4 = Down(128, 128, embed_dim)
+        # effective patch size 16 * 16
+        self.sa1 = SelfAttention(128, 50)
+        self.sa2 = SelfAttention(128, 50)
+        self.sa3 = SelfAttention(128, 50)
+        self.sa4 = SelfAttention(128, 50)
+        # 256 * 25 * 25
+        # self.down5 = Down(128, 256, embed_dim)
+        # # effective patch size 32 * 32
+        # self.sa2 = SelfAttention(256, 25)
+
+        # # 256 * 12 * 12
+        # self.down6 = Down(256, 256, embed_dim)
+        # self.sa3 = SelfAttention(256, 12)
+
+        # self.bot1 = DoubleConv(256, 512)
+        # self.bot2 = DoubleConv(512, 512)
+        # self.bot3 = DoubleConv(512, 256)
+
+        # # 256 * 25 * 25
+        # self.up1 = Up(512, 128, (25, 25), embed_dim)
+        # self.sa4 = SelfAttention(128, 25)
+
+        # # 128 * 50 * 50
+        # self.up2 = Up(256, 128, (50, 50), embed_dim)
+        self.sa5 = SelfAttention(128, 50)
+
+        # 128 * 100 * 100
+        self.up3 = Up(256, 64, (100, 100), embed_dim)
+
+        # 64 * 200 * 200
+        self.up4 = Up(128, 32, (200, 200), embed_dim)
+
+        # 32 * 400 * 400
+        self.up5 = Up(64, 16, (400, 400), embed_dim)
+
+        # 32 * 800 * 800
+        self.up6 = Up(32, 32, (800, 800), embed_dim)
+
+        # 1 * 800 * 800
+        self.outc = nn.Conv2d(32, c_out, kernel_size=1)
+
+        self.sigmoid = sigmoid
+
+    def forward(self, x, t):
+
+        x1 = self.inc(x)
+        x2 = self.down1(x1, t)
+        x3 = self.down2(x2, t)
+        x4 = self.down3(x3, t)
+        x5 = self.down4(x4, t)
+        x5 = self.sa1(x5)
+        # print(x5.shape)
+        x5 = self.sa2(x5)
+        x5 = self.sa3(x5)
+        x5 = self.sa4(x5)
+
+        # x6 = self.down5(x5, t)
+        # x6 = self.sa2(x6)
+        # x7 = self.down6(x6, t)
+        # x7 = self.sa3(x7)
+
+        # x7 = self.bot1(x7)
+        # x7 = self.bot2(x7)
+        # x7 = self.bot3(x7)
+
+        # x = self.up1(x7, x6, t)
+        # x = self.sa4(x)
+        # x = self.up2(x, x5, t)
+        # print(x.shape)
+        x = self.sa5(x5)
+        # print(x.shape)
+        # print(x.shape, x4.shape)
+        x = self.up3(x, x4, t)
+        x = self.up4(x, x3, t)
+        x = self.up5(x, x2, t)
+        x = self.up6(x, x1, t)
+        output = self.outc(x).squeeze(1)
+        if self.sigmoid:
+            output = torch.sigmoid(output)
+        return output
+
+
+class UNet5(nn.Module):
+    def __init__(self, c_in=3, c_out=1, embed_dim=272, sigmoid=True):
+        super().__init__()
+        # self.ini = DoubleConv()
+
+        # 16 * 800 * 800
+        self.inc = DoubleConv(c_in, 16)
+
+        # 16 * 400 * 400
+        self.down1 = Down(16, 32, embed_dim)
+
+        # 64 * 200 * 200
+        self.down2 = Down(32, 64, embed_dim)
+
+        # 128 * 100 * 100
+        self.down3 = Down(64, 128, embed_dim)
+
+        # 256 * 50 * 50
+        self.down4 = Down(128, 512, embed_dim)
+
+        # 512 * 25 * 25
+        # self.down5 = Down(256, 512, embed_dim)
+        self.l = nn.Sequential(nn.Linear(embed_dim, 512), nn.GELU())
+        self.pos_embed = nn.Parameter(torch.randn(1, 2500 + 1, 512))
+        self.transformer = nn.TransformerEncoder(
+            nn.TransformerEncoderLayer(
+                d_model=512,
+                nhead=8,
+                dim_feedforward=1024,
+                dropout=0.1,
+                activation="gelu",
+            ),
+            num_layers=6,
+        )
+        # effective patch size 16 * 16
+        # self.sa1 = SelfAttention(128, 50)
+        # self.sa2 = SelfAttention(128, 50)
+        # self.sa3 = SelfAttention(128, 50)
+        # self.sa4 = SelfAttention(128, 50)
+        # 256 * 25 * 25
+        # self.down5 = Down(128, 256, embed_dim)
+        # # effective patch size 32 * 32
+        # self.sa2 = SelfAttention(256, 25)
+
+        # # 256 * 12 * 12
+        # self.down6 = Down(256, 256, embed_dim)
+        # self.sa3 = SelfAttention(256, 12)
+
+        # self.bot1 = DoubleConv(256, 512)
+        # self.bot2 = DoubleConv(512, 512)
+        # self.bot3 = DoubleConv(512, 256)
+
+        # # 256 * 25 * 25
+        # self.up1 = Up(512, 128, (25, 25), embed_dim)
+        # self.sa4 = SelfAttention(128, 25)
+
+        # # 128 * 50 * 50
+        # self.up2 = Up(512 + 256, 128, (50, 50), embed_dim)
+        # self.sa5 = SelfAttention(128, 50)
+
+        # 128 * 100 * 100
+        self.up3 = Up(512 + 128, 64, (100, 100), embed_dim)
+
+        # 64 * 200 * 200
+        self.up4 = Up(128, 32, (200, 200), embed_dim)
+
+        # 32 * 400 * 400
+        self.up5 = Up(64, 16, (400, 400), embed_dim)
+
+        # 32 * 800 * 800
+        self.up6 = Up(32, 32, (800, 800), embed_dim)
+
+        # 1 * 800 * 800
+        self.outc = nn.Conv2d(32, c_out, kernel_size=1)
+
+        self.sigmoid = sigmoid
+
+    def forward(self, x, t):
+
+        x1 = self.inc(x)
+        x2 = self.down1(x1, t)
+        x3 = self.down2(x2, t)
+        x4 = self.down3(x3, t)
+        x5 = self.down4(x4, t)
+        # x6 = self.down5(x5, t)
+        # x5 = self.sa1(x5)
+        # print(x5.shape)
+        # x5 = self.sa2(x5)
+        # x5 = self.sa3(x5)
+        # x5 = self.sa4(x5)
+        # print(x5.shape)
+        x6 = x5
+        x6 = x6.view(-1, 512, 2500).transpose(1, 2)
+        l = self.l(t).unsqueeze(1)
+        x = torch.cat((l, x6), dim=1)
+        x += self.pos_embed
+        # x5 = x5.transpose()
+        x = self.transformer(x)
+        x = x[:, 1:, :]
+        x = x.transpose(1, 2).view(-1, 512, 50, 50)
+        # x6 = self.down5(x5, t)
+        # x6 = self.sa2(x6)
+        # x7 = self.down6(x6, t)
+        # x7 = self.sa3(x7)
+
+        # x7 = self.bot1(x7)
+        # x7 = self.bot2(x7)
+        # x7 = self.bot3(x7)
+
+        # x = self.up1(x7, x6, t)
+        # x = self.sa4(x)
+        # print(x.shape, x5.shape)
+        # x = self.up2(x, x5, t)
+        # print(x.shape)
+        # x = self.sa5(x5)
+        # print(x.shape)
+        # print(x.shape, x4.shape)
+        x = self.up3(x, x4, t)
+        x = self.up4(x, x3, t)
+        x = self.up5(x, x2, t)
+        x = self.up6(x, x1, t)
+        output = self.outc(x).squeeze(1)
+        if self.sigmoid:
+            output = torch.sigmoid(output)
+        return output
+
+
+class UNet6(nn.Module):
+    def __init__(self, c_in=3, c_out=1, embed_dim=272, sigmoid=True):
+        super().__init__()
+        # self.ini = DoubleConv()
+
+        # 16 * 800 * 800
+        self.inc = DoubleConv(c_in, 16)
+
+        # 16 * 400 * 400
+        self.down1 = Down(16, 32, embed_dim)
+
+        # 64 * 200 * 200
+        self.down2 = Down(32, 64, embed_dim)
+
+        # 128 * 100 * 100
+        self.down3 = Down(64, 128, embed_dim)
+
+        # 256 * 50 * 50
+        self.down4 = Down(128, 256, embed_dim)
+
+        # 512 * 25 * 25
+        self.down5 = Down(256, 512, embed_dim)
+
+        self.l = nn.Sequential(nn.Linear(embed_dim, 512), nn.GELU())
+        self.pos_embed = nn.Parameter(torch.zeros(1, 625 + 1, 512))
+        self.transformer = nn.TransformerEncoder(
+            nn.TransformerEncoderLayer(
+                d_model=512,
+                nhead=8,
+                dim_feedforward=1024,
+                dropout=0.1,
+                activation="gelu",
+            ),
+            num_layers=8,
+        )
+        # effective patch size 16 * 16
+        # self.sa1 = SelfAttention(128, 50)
+        # self.sa2 = SelfAttention(128, 50)
+        # self.sa3 = SelfAttention(128, 50)
+        # self.sa4 = SelfAttention(128, 50)
+        # 256 * 25 * 25
+        # self.down5 = Down(128, 256, embed_dim)
+        # # effective patch size 32 * 32
+        # self.sa2 = SelfAttention(256, 25)
+
+        # # 256 * 12 * 12
+        # self.down6 = Down(256, 256, embed_dim)
+        # self.sa3 = SelfAttention(256, 12)
+
+        # self.bot1 = DoubleConv(256, 512)
+        # self.bot2 = DoubleConv(512, 512)
+        # self.bot3 = DoubleConv(512, 256)
+
+        # # 256 * 25 * 25
+        # self.up1 = Up(512, 128, (25, 25), embed_dim)
+        # self.sa4 = SelfAttention(128, 25)
+
+        # # 128 * 50 * 50
+        self.up2 = Up(512 + 256, 256, (50, 50), embed_dim)
+        # self.sa5 = SelfAttention(128, 50)
+
+        # 128 * 100 * 100
+        self.up3 = Up(256 + 128, 64, (100, 100), embed_dim)
+
+        # 64 * 200 * 200
+        self.up4 = Up(128, 32, (200, 200), embed_dim)
+
+        # 32 * 400 * 400
+        self.up5 = Up(64, 16, (400, 400), embed_dim)
+
+        # 32 * 800 * 800
+        self.up6 = Up(32, 32, (800, 800), embed_dim)
+
+        # 1 * 800 * 800
+        self.outc = nn.Conv2d(32, c_out, kernel_size=1)
+
+        self.sigmoid = sigmoid
+
+    def forward(self, x, t):
+
+        x1 = self.inc(x)
+        x2 = self.down1(x1, t)
+        x3 = self.down2(x2, t)
+        x4 = self.down3(x3, t)
+        x5 = self.down4(x4, t)
+        x6 = self.down5(x5, t)
+        # x5 = self.sa1(x5)
+        # print(x5.shape)
+        # x5 = self.sa2(x5)
+        # x5 = self.sa3(x5)
+        # x5 = self.sa4(x5)
+        # print(x5.shape)
+        # x6 = x5
+        x6 = x6.view(-1, 512, 625).transpose(1, 2)
+        l = self.l(t).unsqueeze(1)
+        x6 = torch.cat((l, x6), dim=1)
+        x6 += self.pos_embed
+        # x5 = x5.transpose()
+        x = self.transformer(x6)
+        x = x[:, 1:, :]
+        x = x.transpose(1, 2).view(-1, 512, 25, 25)
+        # x6 = self.down5(x5, t)
+        # x6 = self.sa2(x6)
+        # x7 = self.down6(x6, t)
+        # x7 = self.sa3(x7)
+
+        # x7 = self.bot1(x7)
+        # x7 = self.bot2(x7)
+        # x7 = self.bot3(x7)
+
+        # x = self.up1(x7, x6, t)
+        # x = self.sa4(x)
+        # print(x.shape, x5.shape)
+        x = self.up2(x, x5, t)
+        # print(x.shape)
+        # x = self.sa5(x5)
+        # print(x.shape)
+        # print(x.shape, x4.shape)
+        x = self.up3(x, x4, t)
+        x = self.up4(x, x3, t)
+        x = self.up5(x, x2, t)
+        x = self.up6(x, x1, t)
+        output = self.outc(x).squeeze(1)
+        if self.sigmoid:
+            output = torch.sigmoid(output)
+        return output
+
+
+class CNNEncoder(nn.Module):
+    def __init__(self, outdim=16):
+        super(CNNEncoder, self).__init__()
+
+        # Convolutional layers to reduce spatial dimensions
+        self.conv1 = nn.Conv2d(
+            in_channels=1, out_channels=32, kernel_size=3, stride=1, padding=1
+        )  # 800x800 -> 800x800
+        self.conv2 = nn.Conv2d(
+            in_channels=32, out_channels=64, kernel_size=3, stride=1, padding=1
+        )  # 800x800 -> 800x800
+        self.pool1 = nn.MaxPool2d(kernel_size=2, stride=2)  # 800x800 -> 400x400
+
+        self.conv3 = nn.Conv2d(
+            in_channels=64, out_channels=128, kernel_size=3, stride=1, padding=1
+        )  # 400x400 -> 400x400
+        self.pool2 = nn.MaxPool2d(kernel_size=2, stride=2)  # 400x400 -> 200x200
+
+        self.conv4 = nn.Conv2d(
+            in_channels=128, out_channels=128, kernel_size=3, stride=1, padding=1
+        )  # 200x200 -> 200x200
+        self.pool3 = nn.MaxPool2d(kernel_size=2, stride=2)  # 200x200 -> 100x100
+
+        self.conv5 = nn.Conv2d(
+            in_channels=128, out_channels=16, kernel_size=3, stride=1, padding=1
+        )  # 100x100 -> 100x100
+        self.pool4 = nn.MaxPool2d(kernel_size=2, stride=2)  # 100x100 -> 50x50
+
+        # Fully connected layers to reduce to 16 dimensions
+        self.fc1 = nn.Linear(16 * 50 * 50, 128)
+        self.fc2 = nn.Linear(128, outdim)
+
+    def forward(self, x):
+        x = x.squeeze()
+        x = x.unsqueeze(1)
+
+        # Pass through convolutional layers
+        x = F.relu(self.conv1(x))
+        x = F.relu(self.conv2(x))
+        x = self.pool1(x)
+
+        x = F.relu(self.conv3(x))
+        x = self.pool2(x)
+
+        x = F.relu(self.conv4(x))
+        x = self.pool3(x)
+
+        x = F.relu(self.conv5(x))
+        x = self.pool4(x)
+
+        # Flatten the output for fully connected layers
+        x = x.view(x.size(0), -1)  # Flatten
+
+        # Pass through fully connected layers
+        x = F.relu(self.fc1(x))
+        x = self.fc2(x)  # Output 16-dimensional vector
+
+        return x
+
+
+class tryUnet(L.LightningModule):
+    def __init__(self, embed_dim=16):
+        super().__init__()
+        self.unet = UNet6(embed_dim=embed_dim)
+        self.encode = CNNEncoder(embed_dim)
+
+    def forward(self, x, mask):
+        t = self.encode(mask)
+        res = self.unet(x, t)
+        return t
+
+    def training_step(self, batch):
+        pixel_values, _, mask = batch
+        pixel_values = pixel_values.to(self.device).float()
+        mask = mask.to(self.device).float()
+        t = self.forward(pixel_values, mask)
+        loss = sigmoid_focal_loss(t, mask, alpha=0.8)
+        self.log("loss", loss.item())
+        return loss
+
+    def configure_optimizers(self):
+        optim = torch.optim.Adam(self.parameters(), lr=1e-4)
+        return optim
+
+
+class ViTSegmentation(nn.Module):
+    def __init__(
+        self,
+        c_in=3,
+        img_size=800,
+        patch_size=32,
+        last_layer=64,
+        embed_dim=256,
+        d_model=512,
+        num_heads=8,
+        num_layers=8,
+        sigmoid=False,
+    ):
+        """
+        Vision Transformer for Image Segmentation.
+
+        Args:
+            img_size (int): Input image size (assumes square images).
+            patch_size (int): Size of each patch.
+            num_classes (int): Number of output segmentation classes.
+            embed_dim (int): Dimension of the embedding space.
+            num_heads (int): Number of attention heads.
+            num_layers (int): Number of transformer encoder layers.
+        """
+        super(ViTSegmentation, self).__init__()
+
+        self.c_in = c_in
+
+        self.img_size = img_size
+        self.patch_size = patch_size
+        self.num_patches = (img_size // patch_size) ** 2
+        self.d_model = d_model
+
+        # Linear projection of flattened patches
+        self.inc = nn.Sequential(
+            nn.Conv2d(c_in, 8, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(8, 16, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(16, last_layer // 2, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+        )
+
+        self.patch_embed = nn.Conv2d(
+            last_layer // 2, d_model, kernel_size=patch_size, stride=patch_size
+        )
+
+        self.embed = nn.Sequential(nn.Linear(embed_dim, d_model))
+
+        # Positional embedding
+        self.pos_embed = nn.Parameter(torch.zeros(1, self.num_patches + 1, d_model))
+
+        # Transformer encoder layers
+        self.transformer = nn.TransformerEncoder(
+            nn.TransformerEncoderLayer(
+                d_model=d_model,
+                nhead=num_heads,
+                dim_feedforward=d_model * 4,
+                dropout=0.1,
+                activation="gelu",
+            ),
+            num_layers=num_layers,
+        )
+
+        # Segmentation head
+        self.segmentation_head = nn.Sequential(
+            nn.Conv2d(d_model, d_model // 2, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(d_model // 2, last_layer // 2, kernel_size=1),
+            nn.ReLU(inplace=True),
+        )
+
+        # Upsampling layer to resize the output to the original image size
+        self.upsample = nn.Upsample(
+            scale_factor=patch_size, mode="bilinear", align_corners=False
+        )
+
+        self.output = nn.Conv2d(last_layer, 1, 3, padding=1)
+
+        self.sigmoid = sigmoid
+
+        # Initialize parameters
+
+    #     self._init_weights()
+
+    # def _init_weights(self):
+    #     nn.init.trunc_normal_(self.pos_embed, std=0.02)
+    #     # nn.init.trunc_normal_(self.cls_token, std=0.02)
+    #     for module in self.segmentation_head:
+    #         if isinstance(module, nn.Conv2d):
+    #             nn.init.kaiming_normal_(
+    #                 module.weight, mode="fan_out", nonlinearity="relu"
+    #             )
+
+    def forward(self, x, t):
+        """
+        Forward pass of the Vision Transformer for segmentation.
+
+        Args:
+            x (torch.Tensor): Input image tensor of shape (B, 3, H, W).
+
+        Returns:
+            torch.Tensor: Segmentation mask of shape (B, num_classes, H, W).
+        """
+        x = x.view(-1, self.c_in, 800, 800)
+        x0 = self.inc(x)
+        B, C, H, W = x.shape
+        assert (
+            H == self.img_size and W == self.img_size
+        ), "Input image size must match model's img_size."
+
+        # Step 1: Patch embedding
+        x = self.patch_embed(x0)  # Shape: (B, embed_dim, H/patch_size, W/patch_size)
+        x = x.flatten(2).transpose(1, 2)  # Shape: (B, num_patches, embed_dim)
+
+        # Step 2: Add class token and positional embedding
+        t = self.embed(t).unsqueeze(1)
+        # cls_tokens = self.cls_token.expand(B, -1, -1)  # Shape: (B, 1, embed_dim)
+        x = torch.cat((t, x), dim=1)  # Shape: (B, num_patches + 1, embed_dim)
+        x = x + self.pos_embed  # Add positional embedding
+
+        # Step 3: Transformer encoder
+        x = self.transformer(x)  # Shape: (B, num_patches + 1, embed_dim)
+
+        # Step 4: Remove class token and reshape to feature map
+        x = x[:, 1:, :]  # Remove class token, Shape: (B, num_patches, embed_dim)
+        x = x.transpose(1, 2).reshape(
+            B,
+            self.d_model,
+            self.img_size // self.patch_size,
+            self.img_size // self.patch_size,
+        )
+
+        # Step 5: Segmentation head
+        x = self.segmentation_head(
+            x
+        )  # Shape: (B, num_classes, H/patch_size, W/patch_size)
+
+        # Step 6: Upsample to original image size
+        x = self.upsample(x)  # Shape: (B, num_classes, H, W)
+        x = torch.cat([x, x0], dim=1)
+        x = self.output(x)
+        x = x.squeeze(1)
+        if self.sigmoid:
+            x = F.sigmoid(x)
+        return x
+
+
+mask_models = {
+    "Unet": UNet,
+    "Unet1": UNet1,
+    "Unet2": UNet2,
+    "Unet3": UNet3,
+    "Unet4": UNet4,
+    "Unet5": UNet5,
+    "Unet6": UNet6,
+    "ViT": ViTSegmentation,
+}

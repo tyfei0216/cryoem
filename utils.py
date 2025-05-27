@@ -484,6 +484,9 @@ def getModel(configs):
     if "additional_input_dim" not in configs["model"]:
         configs["model"]["additional_input_dim"] = 20
 
+    if "mask_model" not in configs["model"]:
+        configs["model"]["mask_model"] = "Unet6"
+
     if "scheduler_step" not in configs["training"]:
         configs["training"]["scheduler_step"] = -1
 
@@ -504,6 +507,7 @@ def getModel(configs):
         dropout=configs["model"]["dropout"],
         scheduler_step=configs["training"]["scheduler_step"],
         warmup_epoches=configs["training"]["warmup_epoches"],
+        mask_model=configs["model"]["mask_model"],
     )
     if "load" in configs["model"] and configs["model"]["load"] is not None:
         t = torch.load(configs["model"]["load"], map_location="cpu")
@@ -713,7 +717,7 @@ def buildStage2(
     # return ret, l
 
 
-def process(outputs, labels, empty=5, need_mask = False):
+def process(outputs, labels, empty=5, need_mask=False):
     ret = []
     boxeses = []
     box_masks = []
@@ -726,7 +730,7 @@ def process(outputs, labels, empty=5, need_mask = False):
     pred_boxes = outputs["pred_boxes"]
 
     match_res = matcher(outputs, labels)
-    
+
     cnts = 0
     for i in range(slice_num):
         label = labels[i]
@@ -749,8 +753,8 @@ def process(outputs, labels, empty=5, need_mask = False):
         box_mask = torch.zeros((num_obj), dtype=torch.long).to(device)
         box_mask.fill_(-1)
         if len(match_res[i][0]) > 0:
-            t = torch.range(0, len(match_res[i][0])-1).long().to(device)
-            box_mask[match_res[i][0]] = t+cnts 
+            t = torch.arange(0, len(match_res[i][0])).long().to(device)
+            box_mask[match_res[i][0]] = t + cnts
             cnts += len(match_res[i][0])
         if need_mask and "masks" in label:
             mask.append(label["masks"][match_res[i][1]])
@@ -797,19 +801,20 @@ from transformers.image_transforms import center_to_corners_format
 
 import modules
 
+
 def get_iou(X):
     iou, _ = modules.box_iou(
-        center_to_corners_format(torch.tensor(X)), center_to_corners_format(torch.tensor(X))
+        center_to_corners_format(torch.tensor(X)),
+        center_to_corners_format(torch.tensor(X)),
     )
     iou = iou.numpy()
     return iou
 
+
 def get_neighbors(X, z_thres1=0.03, z_thres2=0.5, iou_thres=0.4):
     X2 = X[:, 1:5].clone()
     X2[:, 3:] += 0.05
-    iou, _ = modules.box_iou(
-        center_to_corners_format(X2), center_to_corners_format(X2)
-    )
+    iou, _ = modules.box_iou(center_to_corners_format(X2), center_to_corners_format(X2))
     x, y = torch.where(iou > 0.01)
     zposx = X[:, 0][x]
     zposy = X[:, 0][y]
@@ -864,7 +869,9 @@ def convertStage2Dataset(retdict, z_thres1=0.01, z_thres2=0.2, iou_thres=0.4):
     X = retdict["feature"]
 
     # print("building up neighboring graph")
-    xs, ys = get_neighbors(X, z_thres1=z_thres1, z_thres2=z_thres2, iou_thres=iou_thres)
+    xs, ys = get_neighbors(
+        X.clone().detach(), z_thres1=z_thres1, z_thres2=z_thres2, iou_thres=iou_thres
+    )
     # print(xs, ys, len(xs), len(ys))
 
     # print("building up neighboring graph done")
@@ -900,7 +907,7 @@ def convertStage2Dataset(retdict, z_thres1=0.01, z_thres2=0.2, iou_thres=0.4):
     t = Data(x=X, edge_index=edges, y=y)
     t.box_masks = box_masks
     t.boxes = boxes
-    t.edge_label = torch.tensor(edge_label, dtype=torch.long)
+    t.edge_label = edge_label  # torch.tensor(edge_label, dtype=torch.long)
     if "sample_mapping" in retdict:
         t.sample_mapping = torch.tensor(
             [i for i in retdict["sample_mapping"].values()], dtype=int

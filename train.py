@@ -65,7 +65,9 @@ def run():
     print("loading dataset")
     # CHECKPOINT = "facebook/detr-resnet-50"
     # image_processor = DetrImageProcessor.from_pretrained(CHECKPOINT)
-    if configs["model"]["stage"] == "stage 1 + 2" or configs["model"]["stage"] == "stage 1 + 2 + 3":
+    if configs["model"]["stage"] == "stage 1 + 2" or configs["model"][
+        "stage"
+    ].startswith("stage 1 + 2 + 3"):
         ds = utils.get_stage12_dataset(configs)
     elif configs["model"]["stage"] == "stage 1":
         ds = utils.get_stage1_dataset(configs)
@@ -98,7 +100,7 @@ def run():
     )
 
     if configs["model"]["stage"] == "stage mask":
-        monitor = "total_validate_auroc"
+        monitor = "total_validate_mask_auroc"
 
     mode = "min" if monitor == "total_validate_loss" else "max"
 
@@ -108,7 +110,7 @@ def run():
         else "{epoch}-{validate_loss:.4f}-{validate_auroc:.4f}"
     )
     if configs["model"]["stage"] == "stage mask":
-        filename = "{epoch}-{total_validate_auroc:.4f}"
+        filename = "{epoch}-{total_validate_mask_auroc:.4f}"
 
     if configs["model"]["stage"] == "stage 1 + 2":
         filename = "{epoch}-{total_validate_auroc:.4f}-{total_validate_loss:.4f}"
