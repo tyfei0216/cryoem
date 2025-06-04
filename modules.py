@@ -1164,6 +1164,7 @@ class DetrModel(L.LightningModule):
         warmup_epoches=1,
         mask_model="Unet5",
         pick_num=6,
+        mask_alpha=0.8,
     ):
         super().__init__()
         if isinstance(model, dict):
@@ -1221,6 +1222,9 @@ class DetrModel(L.LightningModule):
         self.scheduler_step = scheduler_step
 
         self.num = pick_num
+        self.mask_alpha = mask_alpha
+
+        self.box_in_for_mask = True
 
     def forward(
         self,
@@ -1231,6 +1235,7 @@ class DetrModel(L.LightningModule):
         labels=None,
         mark=None,
         stage_2_embeds=None,
+        box=None,
     ):
         if "stage 1" in self.stage:
             assert pixel_values is not None
@@ -1266,10 +1271,15 @@ class DetrModel(L.LightningModule):
         elif "stage mask" in self.stage:
             assert stage_2_embeds is not None
             assert pixel_values is not None
-            return self.mask_head(
-                pixel_values,
-                stage_2_embeds,
-            )
+            if self.box_in_for_mask:
+                assert box is not None
+                return self.mask_head(
+                    pixel_values,
+                    stage_2_embeds,
+                    box,  # .unsqueeze(1).repeat(1, self.num, 1),
+                )
+            else:
+                return self.mask_head(pixel_values, stage_2_embeds)
 
         else:
             raise NotImplementedError
@@ -1438,16 +1448,16 @@ class DetrModel(L.LightningModule):
 
     #     return loss.sum()
 
-    def common_stage_mask(self, pixel_values, stage_2_embeds, mask, cal_auroc=False):
+    def common_stage_mask(
+        self, pixel_values, stage_2_embeds, mask, cal_auroc=False, box=None
+    ):
         pixel_values = pixel_values.to(self.device).float()
         stage_2_embeds = stage_2_embeds.to(self.device).float()
         mask = mask.to(self.device).float()
-        outputs = self(pixel_values=pixel_values, stage_2_embeds=stage_2_embeds)
-        # print(mask.shape, outputs.shape)
-        # print(outputs[0][:5])
-        # print(mask[0][:5])
-        # print("before focal loss")
-        loss = sigmoid_focal_loss(outputs, mask.float(), alpha=0.2)
+        outputs = self(
+            pixel_values=pixel_values, stage_2_embeds=stage_2_embeds, box=box
+        )
+        loss = sigmoid_focal_loss(outputs, mask.float(), alpha=self.mask_alpha)
         # print("after focal loss")
         if cal_auroc:
             auroc = self.mask_auroc(
@@ -1523,7 +1533,7 @@ class DetrModel(L.LightningModule):
 
             t = torch.no_grad
             if self.lr_detr > 0.0000001:
-                t = EmptyContextManager()
+                t = EmptyContextManager
             # print("stage 1")
             with t():
                 loss, loss_dict, output = self._common_step_stage1(
@@ -1576,17 +1586,21 @@ class DetrModel(L.LightningModule):
                 # y = y[(n // 2) * obj_per_image : (n // 2 + 1) * obj_per_image]
                 # t = retdict["masks"]
                 pick_from = torch.where((sub_box_masks > -1))[0]
+                boxes = outputs["box"]
 
             if len(pick_from) > 0:
                 if len(pick_from) <= self.num:
                     stage_2_embeds = sub_embeds[pick_from]
                     pick_index = sub_box_masks[pick_from]
+                    box = boxes[pick_from]
                     masks = retdict["masks"][pick_index]
+
                 else:
                     tensor = torch.arange(len(pick_from))
                     indices = torch.randperm(tensor.size(0))[: self.num]
                     selected = pick_from[indices]
                     stage_2_embeds = sub_embeds[selected]
+                    box = boxes[selected]
                     pick_index = sub_box_masks[selected]
                     masks = retdict["masks"][pick_index]
                 num_masks = masks.sum(axis=[1, 2])
@@ -1594,9 +1608,10 @@ class DetrModel(L.LightningModule):
                 if num_masks.sum() > 0:
                     stage_2_embeds = stage_2_embeds[num_masks]
                     masks = masks[num_masks]
+                    box = box[num_masks]
                     img = img[None, :, :, :].repeat(stage_2_embeds.shape[0], 1, 1, 1)
                     loss3, loss_dict3 = self.common_stage_mask(
-                        img, stage_2_embeds, masks, True
+                        img, stage_2_embeds, masks, True, box
                     )
                     loss += loss3
                     loss_dict2["mask_auroc"] = loss_dict3["mask_auroc"]
@@ -1700,7 +1715,7 @@ class DetrModel(L.LightningModule):
 
             t = torch.no_grad
             if self.lr_detr > 0.0000001:
-                t = EmptyContextManager()
+                t = EmptyContextManager
 
             with t():
                 loss, loss_dict, output = self._common_step_stage1(
@@ -1748,6 +1763,7 @@ class DetrModel(L.LightningModule):
                 sub_box_masks = box_masks[
                     (n // 2) * obj_per_image : (n // 2 + 1) * obj_per_image
                 ]
+                boxes = outputs["box"]
                 # y = data2.y
                 # y = y[(n // 2) * obj_per_image : (n // 2 + 1) * obj_per_image]
                 pick_from = torch.where((sub_box_masks > -1))[0]
@@ -1756,12 +1772,14 @@ class DetrModel(L.LightningModule):
                 if len(pick_from) <= self.num:
                     stage_2_embeds = sub_embeds[pick_from]
                     pick_index = sub_box_masks[pick_from]
+                    box = boxes[pick_from]
                     masks = retdict["masks"][pick_index]
                 else:
                     tensor = torch.arange(len(pick_from))
                     indices = torch.randperm(tensor.size(0))[: self.num]
                     selected = pick_from[indices]
                     stage_2_embeds = sub_embeds[selected]
+                    box = boxes[selected]
                     pick_index = sub_box_masks[selected]
                     masks = retdict["masks"][pick_index]
                 num_masks = masks.sum(axis=[1, 2])
@@ -1769,9 +1787,10 @@ class DetrModel(L.LightningModule):
                 if num_masks.sum() > 0:
                     stage_2_embeds = stage_2_embeds[num_masks]
                     masks = masks[num_masks]
+                    box = box[num_masks]
                     img = img[None, :, :, :].repeat(stage_2_embeds.shape[0], 1, 1, 1)
                     loss3, loss_dict3 = self.common_stage_mask(
-                        img, stage_2_embeds, masks, True
+                        img, stage_2_embeds, masks, True, box
                     )
                     loss += loss3
                     loss_dict2["mask_auroc"] = loss_dict3["mask_auroc"]
@@ -1936,6 +1955,7 @@ class DetrModel(L.LightningModule):
             else:
                 optim = torch.optim.Adam(parameters, lr=self.lr)
         elif "stage mask" in self.stage:
+            print("fixing all parameters except mask head")
             parameters = []
             for n, p in self.named_parameters():
                 if not "mask_head" in n:
@@ -3080,6 +3100,151 @@ class UNet4(nn.Module):
         return output
 
 
+class UNet7(nn.Module):
+    def __init__(self, c_in=3, c_out=1, embed_dim=272, sigmoid=True):
+        super().__init__()
+        # self.ini = DoubleConv()
+
+        # 16 * 800 * 800
+        self.inc = DoubleConv(c_in + 1, 16)
+
+        # 16 * 400 * 400
+        self.down1 = Down(16, 32, embed_dim)
+
+        # 64 * 200 * 200
+        self.down2 = Down(32, 64, embed_dim)
+
+        # 128 * 100 * 100
+        self.down3 = Down(64, 128, embed_dim)
+
+        # 256 * 50 * 50
+        self.down4 = Down(128, 512, embed_dim)
+
+        # 512 * 25 * 25
+        # self.down5 = Down(256, 512, embed_dim)
+        self.l = nn.Sequential(nn.Linear(embed_dim, 512), nn.GELU())
+        self.pos_embed = nn.Parameter(torch.randn(1, 2500 + 1, 512))
+        self.transformer = nn.TransformerEncoder(
+            nn.TransformerEncoderLayer(
+                d_model=512,
+                nhead=8,
+                dim_feedforward=1024,
+                dropout=0.1,
+                activation="gelu",
+            ),
+            num_layers=6,
+        )
+        # effective patch size 16 * 16
+        # self.sa1 = SelfAttention(128, 50)
+        # self.sa2 = SelfAttention(128, 50)
+        # self.sa3 = SelfAttention(128, 50)
+        # self.sa4 = SelfAttention(128, 50)
+        # 256 * 25 * 25
+        # self.down5 = Down(128, 256, embed_dim)
+        # # effective patch size 32 * 32
+        # self.sa2 = SelfAttention(256, 25)
+
+        # # 256 * 12 * 12
+        # self.down6 = Down(256, 256, embed_dim)
+        # self.sa3 = SelfAttention(256, 12)
+
+        # self.bot1 = DoubleConv(256, 512)
+        # self.bot2 = DoubleConv(512, 512)
+        # self.bot3 = DoubleConv(512, 256)
+
+        # # 256 * 25 * 25
+        # self.up1 = Up(512, 128, (25, 25), embed_dim)
+        # self.sa4 = SelfAttention(128, 25)
+
+        # # 128 * 50 * 50
+        # self.up2 = Up(512 + 256, 128, (50, 50), embed_dim)
+        # self.sa5 = SelfAttention(128, 50)
+
+        # 128 * 100 * 100
+        self.up3 = Up(512 + 128, 64, (100, 100), embed_dim)
+
+        # 64 * 200 * 200
+        self.up4 = Up(128, 32, (200, 200), embed_dim)
+
+        # 32 * 400 * 400
+        self.up5 = Up(64, 16, (400, 400), embed_dim)
+
+        # 32 * 800 * 800
+        self.up6 = Up(32, 32, (800, 800), embed_dim)
+
+        # 1 * 800 * 800
+        self.outc = nn.Conv2d(32, c_out, kernel_size=1)
+
+        self.sigmoid = sigmoid
+
+    def forward(self, x, t, boxes):
+        B, C, H, W = x.shape
+        b1 = boxes[:, 0] - boxes[:, 2] / 2
+        b2 = boxes[:, 0] + boxes[:, 2] / 2
+        b3 = boxes[:, 1] - boxes[:, 3] / 2
+        b4 = boxes[:, 1] + boxes[:, 3] / 2
+        b1, b2, b3, b4 = (
+            (b1 * W).long(),
+            (b2 * W).long(),
+            (b3 * H).long(),
+            (b4 * H).long(),
+        )
+        mask = torch.zeros((B, 1, H, W), device=x.device, dtype=x.dtype)
+        for i in range(B):
+            mask[i, 0, b3[i] : b4[i], b1[i] : b2[i]] = 1.0
+
+        mask.requires_grad_(False)
+
+        x = torch.cat((x, mask), dim=1)
+
+        x1 = self.inc(x)
+        x2 = self.down1(x1, t)
+        x3 = self.down2(x2, t)
+        x4 = self.down3(x3, t)
+        x5 = self.down4(x4, t)
+        # x6 = self.down5(x5, t)
+        # x5 = self.sa1(x5)
+        # print(x5.shape)
+        # x5 = self.sa2(x5)
+        # x5 = self.sa3(x5)
+        # x5 = self.sa4(x5)
+        # print(x5.shape)
+        x6 = x5
+        x6 = x6.view(-1, 512, 2500).transpose(1, 2)
+        l = self.l(t).unsqueeze(1)
+        x = torch.cat((l, x6), dim=1)
+        x += self.pos_embed
+        # x5 = x5.transpose()
+        x = self.transformer(x)
+        x = x[:, 1:, :]
+        x = x.transpose(1, 2).view(-1, 512, 50, 50)
+        # x6 = self.down5(x5, t)
+        # x6 = self.sa2(x6)
+        # x7 = self.down6(x6, t)
+        # x7 = self.sa3(x7)
+
+        # x7 = self.bot1(x7)
+        # x7 = self.bot2(x7)
+        # x7 = self.bot3(x7)
+
+        # x = self.up1(x7, x6, t)
+        # x = self.sa4(x)
+        # print(x.shape, x5.shape)
+        # x = self.up2(x, x5, t)
+        # print(x.shape)
+        # x = self.sa5(x5)
+        # print(x.shape)
+        # print(x.shape, x4.shape)
+        x = self.up3(x, x4, t)
+        x = self.up4(x, x3, t)
+        x = self.up5(x, x2, t)
+        x = self.up6(x, x1, t)
+        output = self.outc(x).squeeze(1)
+        if self.sigmoid:
+            output = torch.sigmoid(output)
+        return output
+
+
 class UNet5(nn.Module):
     def __init__(self, c_in=3, c_out=1, embed_dim=272, sigmoid=True):
         super().__init__()
@@ -3575,6 +3740,7 @@ mask_models = {
     "Unet3": UNet3,
     "Unet4": UNet4,
     "Unet5": UNet5,
+    "Unet7": UNet7,
     "Unet6": UNet6,
     "ViT": ViTSegmentation,
 }

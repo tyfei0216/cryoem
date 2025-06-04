@@ -90,6 +90,17 @@ def transformImage(image):
     return image
 
 
+int_colors = [
+    "#afba03",
+    "#1f7c92",
+    "#c70039",
+    "#4d2e7f",
+    "#03a678",
+    "#f5f5f5",
+    "#ff5733",
+]
+
+
 def drawannotation(image, target, box=True, mask=True, font_size=30):
     import matplotlib.pyplot as plt
     from torchvision.utils import draw_bounding_boxes, draw_segmentation_masks
@@ -106,7 +117,7 @@ def drawannotation(image, target, box=True, mask=True, font_size=30):
             image=image,
             masks=target["masks"],
             alpha=0.3,
-            # colors=[int_colors[i] for i in [class_names.index(label) for label in labels]]
+            # colors=[int_colors[i] for i in target["class_labels"]],
         )
     else:
         annotated_tensor = image
@@ -120,7 +131,7 @@ def drawannotation(image, target, box=True, mask=True, font_size=30):
             labels=target["names"] if "names" in target else target["labels"],
             font_size=font_size,
             width=5,
-            # colors=[int_colors[i] for i in [class_names.index(label) for label in labels]]
+            # colors=[int_colors[i] for i in target["class_labels"]],
         )
     res = annotated_tensor.numpy()
     plt.imshow(np.moveaxis(res, 0, -1))
@@ -496,6 +507,9 @@ def getModel(configs):
     if "pick_num" not in configs["training"]:
         configs["training"]["pick_num"] = 6
 
+    if "mask_alpha" not in configs["training"]:
+        configs["training"]["mask_alpha"] = 0.8
+
     model = modules.DetrModel(
         configs["model"]["stage"],
         models,
@@ -512,6 +526,7 @@ def getModel(configs):
         warmup_epoches=configs["training"]["warmup_epoches"],
         mask_model=configs["model"]["mask_model"],
         pick_num=configs["training"]["pick_num"],
+        mask_alpha=configs["training"]["mask_alpha"],
     )
     if "load" in configs["model"] and configs["model"]["load"] is not None:
         t = torch.load(configs["model"]["load"], map_location="cpu")
@@ -661,6 +676,7 @@ def buildStage2(
     # model_names=["other", "ribo"],
     has_none=False,
     empty=5,
+    seed=None,
 ):
     ret = []
     l = []
@@ -685,7 +701,10 @@ def buildStage2(
     cnts = 0
     for i in range(len(dataset)):
         print("slice", i)
-        data = dataset[i]
+        if seed is not None:
+            data = dataset.__getitem__(i, seed=seed)
+        else:
+            data = dataset.__getitem__(i)
         label = data["labels"]
         with torch.no_grad():
             _ret_dict = processSingle(
