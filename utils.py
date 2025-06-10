@@ -113,11 +113,12 @@ def drawannotation(image, target, box=True, mask=True, font_size=30):
         image = torch.tensor(image * 255).type(torch.uint8)
 
     if "masks" in target and mask:
+        print("masks")
         annotated_tensor = draw_segmentation_masks(
             image=image,
             masks=target["masks"],
-            alpha=0.3,
-            # colors=[int_colors[i] for i in target["class_labels"]],
+            alpha=0.5,
+            colors=[int_colors[i] for i in target["class_labels"]],
         )
     else:
         annotated_tensor = image
@@ -496,7 +497,10 @@ def getModel(configs):
         configs["model"]["additional_input_dim"] = 20
 
     if "mask_model" not in configs["model"]:
-        configs["model"]["mask_model"] = "Unet6"
+        configs["model"]["mask_model"] = "Unet7"
+
+    if "mask_out" not in configs["model"]:
+        configs["model"]["mask_out"] = False
 
     if "scheduler_step" not in configs["training"]:
         configs["training"]["scheduler_step"] = -1
@@ -527,6 +531,7 @@ def getModel(configs):
         mask_model=configs["model"]["mask_model"],
         pick_num=configs["training"]["pick_num"],
         mask_alpha=configs["training"]["mask_alpha"],
+        mask_out=configs["model"]["mask_out"],
     )
     if "load" in configs["model"] and configs["model"]["load"] is not None:
         t = torch.load(configs["model"]["load"], map_location="cpu")
@@ -1187,6 +1192,7 @@ def get_stageMask_dataset(configs):
     pixels = []
     embeds = []
     masks = []
+    boxes = []
     sample_mapping = {}
     num1 = 0
     num2 = 0
@@ -1195,6 +1201,7 @@ def get_stageMask_dataset(configs):
         pixels.extend(data["pixel_values"])
         embeds.append(data["embed"])
         masks.append(data["masks"])
+        boxes.append(data["boxes"])
         for j in data["sample_mapping"]:
             sample_mapping[j + num1] = data["sample_mapping"][j] + num2
         num1 += len(data["sample_mapping"])
@@ -1203,11 +1210,13 @@ def get_stageMask_dataset(configs):
     pixels = torch.stack(pixels, dim=0)
     embeds = torch.cat(embeds, dim=0)
     masks = torch.cat(masks, dim=0)
+    boxes = torch.cat(boxes, dim=0)
     ds = modules.stage2MaskDataModule(
         pixels,
         embeds,
         masks,
         sample_mapping,
+        boxes=boxes,
         batch_size=configs["training"]["train_batch_size"],
     )
     return ds
@@ -1319,11 +1328,15 @@ def calculate_precision_recall(pred_bboxes_list, gt_bboxes_list, iou_threshold=0
     fp = 0  # False positives
     fn = 0  # False negatives
 
-    matched_gt = []  # Keep track of which ground truth boxes are matched
+    # Keep track of which ground truth boxes are matched
     for pred_bboxes, gt_bboxes in zip(pred_bboxes_list, gt_bboxes_list):
+        matched_gt = []
         for pred_bbox in pred_bboxes:
             ious = [calculate_iou(pred_bbox, gt_bbox) for gt_bbox in gt_bboxes]
-            max_iou = max(ious)
+            if len(ious) == 0:
+                max_iou = 0
+            else:
+                max_iou = max(ious)
 
             if max_iou >= iou_threshold:
                 idx = ious.index(max_iou)
@@ -1335,7 +1348,9 @@ def calculate_precision_recall(pred_bboxes_list, gt_bboxes_list, iou_threshold=0
             else:
                 fp += 1
 
-    fn = len(gt_bboxes) - len(matched_gt)
+        fn += len(gt_bboxes) - len(matched_gt)
+
+    print(tp, fp, fn)
 
     precision = tp / (tp + fp) if (tp + fp) > 0 else 0
     recall = tp / (tp + fn) if (tp + fn) > 0 else 0

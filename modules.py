@@ -171,21 +171,32 @@ class stage2DatasetNew(Gdataset):
 
 
 class stage2MaskDataset(Dataset):
-    def __init__(self, input_image_list, input_embed, target_masks, sample_mapping):
+    def __init__(
+        self, input_image_list, input_embed, target_masks, sample_mapping, boxes=None
+    ):
         self.input_image_list = input_image_list
         self.input_embed = input_embed
         self.target_mask = target_masks
         self.sample_mapping = sample_mapping
+        self.boxes = boxes
 
     def __len__(self):
         return self.target_mask.shape[0]
 
     def __getitem__(self, index):
-        return (
-            self.input_image_list[self.sample_mapping[index]],
-            self.input_embed[index],
-            self.target_mask[index],
-        )
+        if self.boxes is None:
+            return (
+                self.input_image_list[self.sample_mapping[index]],
+                self.input_embed[index],
+                self.target_mask[index],
+            )
+        else:
+            return (
+                self.input_image_list[self.sample_mapping[index]],
+                self.input_embed[index],
+                self.target_mask[index],
+                self.boxes[index],
+            )
 
 
 class stage2MaskDataModule(L.LightningDataModule):
@@ -195,13 +206,14 @@ class stage2MaskDataModule(L.LightningDataModule):
         input_embed,
         target_masks,
         sample_mapping,
+        boxes=None,
         batch_size=2,
         train_val=[0.8, 0.2],
         seed=1013,
     ):
         super().__init__()
         self.dataset = stage2MaskDataset(
-            input_image_list, input_embed, target_masks, sample_mapping
+            input_image_list, input_embed, target_masks, sample_mapping, boxes
         )
         torch.manual_seed(seed)
         self.train_set, self.val_set = torch.utils.data.random_split(
@@ -1165,6 +1177,7 @@ class DetrModel(L.LightningModule):
         mask_model="Unet5",
         pick_num=6,
         mask_alpha=0.8,
+        mask_out=False,
     ):
         super().__init__()
         if isinstance(model, dict):
@@ -1217,7 +1230,9 @@ class DetrModel(L.LightningModule):
         t[-1] = 0.1
         self.cri = nn.CrossEntropyLoss(weight=t)
         self.output_dim = output_dim
-        self.mask_head = mask_models[mask_model](embed_dim=feature_dim, sigmoid=False)
+        self.mask_head = mask_models[mask_model](
+            embed_dim=feature_dim, sigmoid=False, mask_out=mask_out
+        )
 
         self.scheduler_step = scheduler_step
 
@@ -1434,19 +1449,6 @@ class DetrModel(L.LightningModule):
         if return_outputs:
             return loss, loss_dict, ret_dict
         return loss, loss_dict
-
-    # def focal_loss(self, inputs, targets, alpha: float = 0.75, gamma: float = 2):
-
-    #     ce_loss = F.binary_cross_entropy(inputs, targets, reduction="none")
-    #     # add modulating factor
-    #     p_t = inputs.detach() * targets + (1 - inputs.detach()) * (1 - targets)
-    #     loss = ce_loss * ((1 - p_t) ** gamma)
-
-    #     if alpha >= 0:
-    #         alpha_t = alpha * targets + (1 - alpha) * (1 - targets)
-    #         loss = alpha_t * loss
-
-    #     return loss.sum()
 
     def common_stage_mask(
         self, pixel_values, stage_2_embeds, mask, cal_auroc=False, box=None
@@ -1694,10 +1696,10 @@ class DetrModel(L.LightningModule):
 
         elif "stage mask" in self.stage:
 
-            pixel_values, stage_2_embeds, pixel_mask = batch
+            pixel_values, stage_2_embeds, pixel_mask, box = batch
             # print(pixel_mask)
             loss, loss_dict = self.common_stage_mask(
-                pixel_values, stage_2_embeds, pixel_mask, True
+                pixel_values, stage_2_embeds, pixel_mask, True, box=box
             )
 
         # logs metrics for each training_step, and the average across the epoch
@@ -1865,9 +1867,9 @@ class DetrModel(L.LightningModule):
                 edge_mask,
             )
         elif "stage mask" in self.stage:
-            pixel_values, stage_2_embeds, pixel_mask = batch
+            pixel_values, stage_2_embeds, pixel_mask, box = batch
             loss, loss_dict = self.common_stage_mask(
-                pixel_values, stage_2_embeds, pixel_mask, True
+                pixel_values, stage_2_embeds, pixel_mask, True, box
             )
         res = {}
         res["loss"] = loss.detach().cpu()
@@ -2008,109 +2010,6 @@ class DetrModel(L.LightningModule):
         return torch.optim.Adam(
             self.parameters(), lr=self.lr, weight_decay=self.weight_decay
         )
-
-
-# only used for pretraining now unused
-class Detr(L.LightningModule):
-
-    def __init__(self, lr, weight_decay, model, lr_backbone=None):
-        super().__init__()
-        self.model = model
-
-        self.lr = lr
-        self.lr_backbone = lr_backbone
-        self.weight_decay = weight_decay
-        self.training_step_outputs = []
-        self.val_step_outputs = []
-
-    def forward(self, pixel_values, pixel_mask, labels=None):
-
-        # pixel_values = pixel_values.to(self.device)
-        # pixel_mask = pixel_mask.to(self.device)
-        if labels is not None:
-            labels = [{k: v.to(self.device) for k, v in t.items()} for t in labels]
-            outputs = self.model(
-                pixel_values=pixel_values, pixel_mask=pixel_mask, labels=labels
-            )
-        else:
-            outputs = self.model(pixel_values=pixel_values, pixel_mask=pixel_mask)
-        return outputs
-
-    # def forward(self, pixel_values, pixel_mask):
-    #     return self.model(pixel_values=pixel_values, pixel_mask=pixel_mask)
-
-    def common_step(self, batch, batch_idx):
-
-        pixel_values = batch[0]["pixel_values"]
-        pixel_mask = batch[0]["pixel_mask"]
-        labels = [
-            {k: v.to(self.device) for k, v in t.items()} for t in batch[0]["labels"]
-        ]
-
-        outputs = self.model(
-            pixel_values=pixel_values, pixel_mask=pixel_mask, labels=labels
-        )
-
-        loss = outputs.loss
-        loss_dict = outputs.loss_dict
-
-        return loss, loss_dict
-
-    def on_validation_epoch_end(self):
-        loss = torch.stack(self.val_step_outputs).mean()
-        loss = np.mean(self.val_step_outputs)
-        self.log("validate_loss", loss)
-        self.val_step_outputs.clear()
-
-    def training_step(self, batch, batch_idx):
-        loss, loss_dict = self.common_step(batch, batch_idx)
-        # logs metrics for each training_step, and the average across the epoch
-        self.log("training_loss", loss, prog_bar=True)
-        for k, v in loss_dict.items():
-            self.log("train_" + k, v.item())
-
-        return loss
-
-    def validation_step(self, batch, batch_idx):
-        loss, loss_dict = self.common_step(batch, batch_idx)
-        self.val_step_outputs.append(loss.detach().cpu())
-        self.log("validation/loss", loss)
-        for k, v in loss_dict.items():
-            self.log("validation_" + k, v.item())
-
-        return loss
-
-    def configure_optimizers(self):
-        # DETR authors decided to use different learning rate for backbone
-        # you can learn more about it here:
-        # - https://github.com/facebookresearch/detr/blob/3af9fa878e73b6894ce3596450a8d9b89d918ca9/main.py#L22-L23
-        # - https://github.com/facebookresearch/detr/blob/3af9fa878e73b6894ce3596450a8d9b89d918ca9/main.py#L131-L139
-        if self.lr_backbone is not None:
-            # self.lr_backbone = self.lr
-            param_dicts = [
-                {
-                    "params": [
-                        p
-                        for n, p in self.named_parameters()
-                        if "backbone" not in n and p.requires_grad
-                    ]
-                },
-                {
-                    "params": [
-                        p
-                        for n, p in self.named_parameters()
-                        if "backbone" in n and p.requires_grad
-                    ],
-                    "lr": self.lr_backbone,
-                },
-            ]
-            return torch.optim.AdamW(
-                param_dicts, lr=self.lr, weight_decay=self.weight_decay
-            )
-        else:
-            return torch.optim.AdamW(
-                self.parameters(), lr=self.lr, weight_decay=self.weight_decay
-            )
 
 
 class EMDataModule(L.LightningDataModule):
@@ -3101,7 +3000,7 @@ class UNet4(nn.Module):
 
 
 class UNet7(nn.Module):
-    def __init__(self, c_in=3, c_out=1, embed_dim=272, sigmoid=True):
+    def __init__(self, c_in=3, c_out=1, embed_dim=272, sigmoid=True, mask_out=False):
         super().__init__()
         # self.ini = DoubleConv()
 
@@ -3177,6 +3076,8 @@ class UNet7(nn.Module):
 
         self.sigmoid = sigmoid
 
+        self.mask_out = mask_out
+
     def forward(self, x, t, boxes):
         B, C, H, W = x.shape
         b1 = boxes[:, 0] - boxes[:, 2] / 2
@@ -3242,6 +3143,9 @@ class UNet7(nn.Module):
         output = self.outc(x).squeeze(1)
         if self.sigmoid:
             output = torch.sigmoid(output)
+
+        if self.mask_out:
+            output[~mask.squeeze(1).bool()] = -5.0
         return output
 
 
