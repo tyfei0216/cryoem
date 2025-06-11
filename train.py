@@ -2,27 +2,13 @@ import argparse
 import json
 import os
 
-import numpy as np
 import pytorch_lightning as L
-import tensorboard
 import torch
 from pytorch_lightning import Trainer
 from pytorch_lightning.callbacks import ModelCheckpoint
 from pytorch_lightning.loggers import TensorBoardLogger
-from torch.utils.data import DataLoader
-from transformers import (
-    ConditionalDetrConfig,
-    ConditionalDetrForObjectDetection,
-    ConditionalDetrForSegmentation,
-    DeformableDetrConfig,
-    DeformableDetrForObjectDetection,
-    DetrConfig,
-    DetrForObjectDetection,
-    DetrForSegmentation,
-    DetrImageProcessor,
-)
 
-import modules
+import data
 import utils
 
 torch.set_float32_matmul_precision("high")
@@ -68,13 +54,13 @@ def run():
     if configs["model"]["stage"] == "stage 1 + 2" or configs["model"][
         "stage"
     ].startswith("stage 1 + 2 + 3"):
-        ds = utils.get_stage12_dataset(configs)
+        ds = data.get_stage12_dataset(configs)
     elif configs["model"]["stage"] == "stage 1":
-        ds = utils.get_stage1_dataset(configs)
+        ds = data.get_stage1_dataset(configs)
     elif configs["model"]["stage"] == "stage 2":
-        ds = utils.get_stage2_dataset(configs)
+        ds = data.get_stage2_dataset(configs)
     elif configs["model"]["stage"] == "stage mask":
-        ds = utils.get_stageMask_dataset(configs)
+        ds = data.get_stageMask_dataset(configs)
 
     print("finish loading data")
 

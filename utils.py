@@ -5,12 +5,12 @@ from typing import List
 import mrcfile
 import numpy as np
 import pandas as pd
-import pycocotools
 import pytorch_lightning as L
 import torch
 import torch.nn as nn
-import torchvision.datasets
 import torchvision.transforms.v2 as transforms
+from sklearn.neighbors import NearestNeighbors
+from torch_geometric.data import Data
 from torchvision.tv_tensors import BoundingBoxes, Mask
 from tqdm import tqdm
 from transformers import (
@@ -24,72 +24,11 @@ from transformers import (
     DetrForSegmentation,
     DetrImageProcessor,
 )
+from transformers.image_transforms import center_to_corners_format
 
 import modules
 
-
-def getDefaultTransform():
-
-    allt = transforms.Compose(
-        [
-            transforms.ToDtype(torch.float32, scale=True),
-            # transforms.Normalize(mean=[0, 0, 0], std=[1, 1, 1], inplace=True),
-            transforms.RandomResize(600, 1000),
-            # transforms.Lambda(lambda x:torch.clamp(x, min=-4.0, max=4.0)),
-            transforms.RandomIoUCrop(min_scale=0.8),
-            transforms.RandomHorizontalFlip(p=0.5),
-            transforms.RandomVerticalFlip(p=0.5),
-            transforms.SanitizeBoundingBoxes(min_size=5),
-        ]
-    )
-    return allt
-
-
-def getSimpleTransform():
-
-    allt = transforms.Compose(
-        [
-            transforms.ToDtype(torch.float32, scale=True),
-            # transforms.Normalize(mean=[0, 0, 0], std=[1, 1, 1], inplace=True),
-            # transforms.RandomResize(600, 1000),
-            # transforms.Lambda(lambda x:torch.clamp(x, min=-4.0, max=4.0)),
-            # transforms.RandomIoUCrop(),
-            transforms.RandomHorizontalFlip(p=0.5),
-            transforms.RandomVerticalFlip(p=0.5),
-            transforms.SanitizeBoundingBoxes(min_size=5),
-        ]
-    )
-    return allt
-
-
-def getConstantTransform():
-    allt = transforms.Compose(
-        [
-            transforms.ToDtype(torch.float32, scale=True),
-            # transforms.Normalize(mean=[0, 0, 0], std=[1, 1, 1], inplace=True),
-            # transforms.RandomResize(600, 1000),
-            # transforms.Lambda(lambda x:torch.clamp(x, min=-4.0, max=4.0)),
-            # transforms.RandomIoUCrop(),
-            # transforms.RandomHorizontalFlip(p=0.5),
-            # transforms.RandomVerticalFlip(p=0.5),
-            transforms.SanitizeBoundingBoxes(min_size=5),
-        ]
-    )
-    return allt
-
-
-def transformImage(image):
-    T1 = transforms.Compose(
-        [
-            transforms.ToDtype(torch.float32, scale=True),
-            transforms.Normalize(mean=[0, 0, 0], std=[1, 1, 1]),
-            transforms.RandomCrop((800, 800)),
-        ]
-    )
-    image = T1(image)
-    return image
-
-
+# helper function for post processing and visualization
 int_colors = [
     "#afba03",
     "#1f7c92",
@@ -136,74 +75,6 @@ def drawannotation(image, target, box=True, mask=True, font_size=30):
         )
     res = annotated_tensor.numpy()
     plt.imshow(np.moveaxis(res, 0, -1))
-
-
-def readTomogram(filename):
-    with mrcfile.open(filename, permissive=True) as m:
-        return m.data
-
-
-def rleUncompressed(a: np.ndarray):
-    a = a.flatten()
-    res = []
-    t = 0
-    pnt = 0
-    cnt = 0
-    while pnt != len(a):
-        assert a[pnt] == 0 or a[pnt] == 1
-        if a[pnt] == t:
-            pnt += 1
-            cnt += 1
-        else:
-            t = 1 - t
-            res.append(cnt)
-            cnt = 0
-    return res
-
-
-def get_collate_fn(image_processor):
-    def collate_fn(batch):
-        # DETR authors employ various image sizes during training, making it not possible
-        # to directly batch together images. Hence they pad the images to the biggest
-        # resolution in a given batch, and create a corresponding binary pixel_mask
-        # which indicates which pixels are real/which are padding
-        pixel_values = [item[0] for item in batch]
-        encoding = image_processor.pad(
-            pixel_values,
-            return_tensors="pt",  # , pad_size={"height": 800, "width": 800}
-        )
-        labels = [item[1] for item in batch]
-        return {
-            "pixel_values": encoding["pixel_values"],
-            "pixel_mask": encoding["pixel_mask"],
-            "labels": labels,
-        }
-
-    return collate_fn
-
-
-def stackBatch(batch):
-    pixel_values = torch.stack([item["pixel_values"] for item in batch])
-    pixel_mask = torch.stack([item["pixel_mask"] for item in batch])
-    labels = [item["labels"] for item in batch]
-    ret = {
-        "pixel_values": pixel_values,
-        "pixel_mask": pixel_mask,
-        "labels": labels,
-        # "marks": marks,
-    }
-    if "mark" in batch[0]:
-        mark = [item["mark"] for item in batch]
-    ret["mark"] = mark
-    return ret
-
-
-def identicalMapping(batch):
-    return batch
-
-
-def collect_graph(batch):
-    return batch[0]
 
 
 def mask_iou(mask1, mask2):
@@ -378,185 +249,12 @@ def toTarget(result, size):
         }
 
 
-def buildModel(configs, args, checkpoint=None):
-    if configs["model"]["name"] == "conditional_detr":
-        if configs["model"]["task"] == "segmentation":
-            config = ConditionalDetrConfig(use_pretrained_backbone=False, **args)
-            seg_model = ConditionalDetrForSegmentation(config)
-            if len(configs["model"]["pretrained"]) > 0:
-                model = ConditionalDetrForObjectDetection.from_pretrained(
-                    configs["model"]["pretrained"], ignore_mismatched_sizes=True, **args
-                )
-                seg_model.conditional_detr.load_state_dict(model.state_dict())
-            model = seg_model
-        elif configs["model"]["task"] == "detection":
-            if len(configs["model"]["pretrained"]) > 0:
-                model = ConditionalDetrForObjectDetection.from_pretrained(
-                    configs["model"]["pretrained"], ignore_mismatched_sizes=True, **args
-                )
-            else:
-                config = ConditionalDetrConfig(use_pretrained_backbone=False, **args)
-                model = ConditionalDetrForObjectDetection(config)
-
-    elif configs["model"]["name"] == "deformable_detr":
-        if len(configs["model"]["pretrained"]) > 0:
-            model = DeformableDetrForObjectDetection.from_pretrained(
-                configs["model"]["pretrained"], ignore_mismatched_sizes=True, **args
-            )
-        else:
-            config = DeformableDetrConfig(use_pretrained_backbone=False, **args)
-            model = DeformableDetrForObjectDetection(config)
-
-    elif configs["model"]["name"] == "detr":
-        if configs["model"]["task"] == "segmentation":
-            if len(configs["model"]["pretrained"]) > 0:
-                model = DetrForSegmentation.from_pretrained(
-                    configs["model"]["pretrained"], ignore_mismatched_sizes=True, **args
-                )
-            else:
-                config = DetrConfig(use_pretrained_backbone=False, **args)
-                model = DetrForSegmentation(config)
-        elif configs["model"]["task"] == "detection":
-            if len(configs["model"]["pretrained"]) > 0:
-                model = DetrForObjectDetection.from_pretrained(
-                    configs["model"]["pretrained"], ignore_mismatched_sizes=True, **args
-                )
-            else:
-                config = DetrConfig(use_pretrained_backbone=False, **args)
-                model = DetrForObjectDetection(config)
-    else:
-        raise NotImplementedError
-
-    if (
-        "renew_position_embeddings" in configs["model"]
-        and configs["model"]["renew_position_embeddings"]
-    ):
-        print("renew position embeddings")
-        state_dict = model.state_dict()
-        for i in state_dict:
-            if "query_position_embeddings" in i:
-                state_dict[i] = torch.randn(state_dict[i].shape)
-        model.load_state_dict(state_dict)
-
-    if checkpoint is not None and len(checkpoint) > 0:
-        if checkpoint.endswith(".ckpt"):
-            ckpt = torch.load(checkpoint)["state_dict"]
-        else:
-            ckpt = torch.load(checkpoint)
-        for i, j in model.named_parameters():
-            if i in ckpt and j.shape != ckpt[i].shape:
-                if "query_position_embeddings" not in i:
-                    del ckpt[i]
-                else:
-                    t = j.clone()
-                    t[: min(t.shape[0], ckpt[i].shape[0])] = ckpt[i][
-                        : min(t.shape[0], ckpt[i].shape[0])
-                    ]
-                    # t = torch.randn_like(j)
-                    ckpt[i] = t
-        need_del = []
-        p = [j for j, _ in model.named_parameters()]
-        for i in ckpt:
-            if i not in p or ckpt[i].shape != model.state_dict()[i].shape:
-                need_del.append(i)
-        for i in need_del:
-            del ckpt[i]
-        model.load_state_dict(ckpt, strict=False)
-
-    return model
-
-
-def getModel(configs):
-
-    if "checkpoint" not in configs["model"]:
-        configs["model"]["checkpoint"] = None
-
-    if isinstance(configs["data"]["require_mask"], dict):
-
-        models = {}
-
-        for i in configs["model"]["args"]:
-            models[i] = buildModel(
-                configs, configs["model"]["args"][i], configs["model"]["checkpoint"]
-            )
-    else:
-        models = buildModel(
-            configs, configs["model"]["args"], configs["model"]["checkpoint"]
-        )
-
-    if "lr_backbone" not in configs["training"]:
-        configs["training"]["lr_backbone"] = None
-
-    if "lr_detr" not in configs["training"]:
-        configs["training"]["lr_detr"] = None
-
-    if "dropout" not in configs["model"]:
-        configs["model"]["dropout"] = False
-
-    if "additional_input_dim" not in configs["model"]:
-        configs["model"]["additional_input_dim"] = 20
-
-    if "mask_model" not in configs["model"]:
-        configs["model"]["mask_model"] = "Unet7"
-
-    if "mask_out" not in configs["model"]:
-        configs["model"]["mask_out"] = False
-
-    if "scheduler_step" not in configs["training"]:
-        configs["training"]["scheduler_step"] = -1
-
-    if "warmup_epoches" not in configs["training"]:
-        configs["training"]["warmup_epoches"] = 0
-
-    if "pick_num" not in configs["training"]:
-        configs["training"]["pick_num"] = 6
-
-    if "mask_alpha" not in configs["training"]:
-        configs["training"]["mask_alpha"] = 0.8
-
-    model = modules.DetrModel(
-        configs["model"]["stage"],
-        models,
-        lr=configs["training"]["lr"],
-        lr_backbone=configs["training"]["lr_backbone"],
-        lr_detr=configs["training"]["lr_detr"],
-        weight_decay=configs["training"]["weight_decay"],
-        feature_dim=configs["model"]["feature_dim"],
-        additional_input_dim=configs["model"]["additional_input_dim"],
-        output_dim=configs["model"]["output_dim"],
-        layer_type=configs["model"]["layer_type"],
-        dropout=configs["model"]["dropout"],
-        scheduler_step=configs["training"]["scheduler_step"],
-        warmup_epoches=configs["training"]["warmup_epoches"],
-        mask_model=configs["model"]["mask_model"],
-        pick_num=configs["training"]["pick_num"],
-        mask_alpha=configs["training"]["mask_alpha"],
-        mask_out=configs["model"]["mask_out"],
-    )
-    if "load" in configs["model"] and configs["model"]["load"] is not None:
-        t = torch.load(configs["model"]["load"], map_location="cpu")
-        ckpt = t["state_dict"]
-        need_del = []
-        p = list(model.state_dict().keys())  # [j for j, _ in model.named_parameters()]
-        # print("model parameters ", p)
-        for i in ckpt:
-            if i not in p or ckpt[i].shape != model.state_dict()[i].shape:
-                need_del.append(i)
-        for i in need_del:
-            del ckpt[i]
-        print("incompatible parameters", need_del)
-        model.load_state_dict(ckpt, strict=False)
-        print("finish loading parameters")
-
-    return model
-
-
+# helper functions for stage 2 processing
 from transformers.models.deformable_detr.modeling_deformable_detr import (
     DeformableDetrHungarianMatcher,
 )
 
 matcher = DeformableDetrHungarianMatcher(1.0, 5.0, 2.0)
-matcher
 
 
 def processSingle(model, label, data, target_size, thres, has_none, empty=5):
@@ -823,13 +521,6 @@ def process(outputs, labels, empty=5, need_mask=False):
     }
 
 
-from sklearn.neighbors import NearestNeighbors
-from torch_geometric.data import Data
-from transformers.image_transforms import center_to_corners_format
-
-import modules
-
-
 def get_iou(X):
     iou, _ = modules.box_iou(
         center_to_corners_format(torch.tensor(X)),
@@ -943,6 +634,173 @@ def convertStage2Dataset(retdict, z_thres1=0.01, z_thres2=0.2, iou_thres=0.4):
     return t
 
 
+# helper functions for model building
+def buildModel(configs, args, checkpoint=None):
+    if configs["model"]["name"] == "conditional_detr":
+        if configs["model"]["task"] == "segmentation":
+            config = ConditionalDetrConfig(use_pretrained_backbone=False, **args)
+            seg_model = ConditionalDetrForSegmentation(config)
+            if len(configs["model"]["pretrained"]) > 0:
+                model = ConditionalDetrForObjectDetection.from_pretrained(
+                    configs["model"]["pretrained"], ignore_mismatched_sizes=True, **args
+                )
+                seg_model.conditional_detr.load_state_dict(model.state_dict())
+            model = seg_model
+        elif configs["model"]["task"] == "detection":
+            if len(configs["model"]["pretrained"]) > 0:
+                model = ConditionalDetrForObjectDetection.from_pretrained(
+                    configs["model"]["pretrained"], ignore_mismatched_sizes=True, **args
+                )
+            else:
+                config = ConditionalDetrConfig(use_pretrained_backbone=False, **args)
+                model = ConditionalDetrForObjectDetection(config)
+
+    elif configs["model"]["name"] == "deformable_detr":
+        if len(configs["model"]["pretrained"]) > 0:
+            model = DeformableDetrForObjectDetection.from_pretrained(
+                configs["model"]["pretrained"], ignore_mismatched_sizes=True, **args
+            )
+        else:
+            config = DeformableDetrConfig(use_pretrained_backbone=False, **args)
+            model = DeformableDetrForObjectDetection(config)
+
+    elif configs["model"]["name"] == "detr":
+        if configs["model"]["task"] == "segmentation":
+            if len(configs["model"]["pretrained"]) > 0:
+                model = DetrForSegmentation.from_pretrained(
+                    configs["model"]["pretrained"], ignore_mismatched_sizes=True, **args
+                )
+            else:
+                config = DetrConfig(use_pretrained_backbone=False, **args)
+                model = DetrForSegmentation(config)
+        elif configs["model"]["task"] == "detection":
+            if len(configs["model"]["pretrained"]) > 0:
+                model = DetrForObjectDetection.from_pretrained(
+                    configs["model"]["pretrained"], ignore_mismatched_sizes=True, **args
+                )
+            else:
+                config = DetrConfig(use_pretrained_backbone=False, **args)
+                model = DetrForObjectDetection(config)
+    else:
+        raise NotImplementedError
+
+    if (
+        "renew_position_embeddings" in configs["model"]
+        and configs["model"]["renew_position_embeddings"]
+    ):
+        print("renew position embeddings")
+        state_dict = model.state_dict()
+        for i in state_dict:
+            if "query_position_embeddings" in i:
+                state_dict[i] = torch.randn(state_dict[i].shape)
+        model.load_state_dict(state_dict)
+
+    if checkpoint is not None and len(checkpoint) > 0:
+        if checkpoint.endswith(".ckpt"):
+            ckpt = torch.load(checkpoint)["state_dict"]
+        else:
+            ckpt = torch.load(checkpoint)
+        for i, j in model.named_parameters():
+            if i in ckpt and j.shape != ckpt[i].shape:
+                if "query_position_embeddings" not in i:
+                    del ckpt[i]
+                else:
+                    t = j.clone()
+                    t[: min(t.shape[0], ckpt[i].shape[0])] = ckpt[i][
+                        : min(t.shape[0], ckpt[i].shape[0])
+                    ]
+                    # t = torch.randn_like(j)
+                    ckpt[i] = t
+        need_del = []
+        p = [j for j, _ in model.named_parameters()]
+        for i in ckpt:
+            if i not in p or ckpt[i].shape != model.state_dict()[i].shape:
+                need_del.append(i)
+        for i in need_del:
+            del ckpt[i]
+        model.load_state_dict(ckpt, strict=False)
+
+    return model
+
+
+def getModel(configs):
+
+    if "checkpoint" not in configs["model"]:
+        configs["model"]["checkpoint"] = None
+
+    if isinstance(configs["data"]["require_mask"], dict):
+
+        models = {}
+
+        for i in configs["model"]["args"]:
+            models[i] = buildModel(
+                configs, configs["model"]["args"][i], configs["model"]["checkpoint"]
+            )
+    else:
+        models = buildModel(
+            configs, configs["model"]["args"], configs["model"]["checkpoint"]
+        )
+
+    if "lr_backbone" not in configs["training"]:
+        configs["training"]["lr_backbone"] = None
+
+    if "lr_detr" not in configs["training"]:
+        configs["training"]["lr_detr"] = None
+
+    if "dropout" not in configs["model"]:
+        configs["model"]["dropout"] = False
+
+    if "additional_input_dim" not in configs["model"]:
+        configs["model"]["additional_input_dim"] = 20
+
+    if "scheduler_step" not in configs["training"]:
+        configs["training"]["scheduler_step"] = -1
+
+    if "warmup_epoches" not in configs["training"]:
+        configs["training"]["warmup_epoches"] = 0
+
+    if "pick_num" not in configs["training"]:
+        configs["training"]["pick_num"] = 6
+
+    if "mask_alpha" not in configs["training"]:
+        configs["training"]["mask_alpha"] = 0.8
+
+    model = modules.DetrModel(
+        configs["model"]["stage"],
+        models,
+        lr=configs["training"]["lr"],
+        lr_backbone=configs["training"]["lr_backbone"],
+        lr_detr=configs["training"]["lr_detr"],
+        weight_decay=configs["training"]["weight_decay"],
+        feature_dim=configs["model"]["feature_dim"],
+        additional_input_dim=configs["model"]["additional_input_dim"],
+        output_dim=configs["model"]["output_dim"],
+        layer_type=configs["model"]["layer_type"],
+        dropout=configs["model"]["dropout"],
+        scheduler_step=configs["training"]["scheduler_step"],
+        warmup_epoches=configs["training"]["warmup_epoches"],
+        pick_num=configs["training"]["pick_num"],
+        mask_alpha=configs["training"]["mask_alpha"],
+    )
+
+    if "load" in configs["model"] and configs["model"]["load"] is not None:
+        t = torch.load(configs["model"]["load"], map_location="cpu")
+        ckpt = t["state_dict"]
+        need_del = []
+        p = list(model.state_dict().keys())  # [j for j, _ in model.named_parameters()]
+        # print("model parameters ", p)
+        for i in ckpt:
+            if i not in p or ckpt[i].shape != model.state_dict()[i].shape:
+                need_del.append(i)
+        for i in need_del:
+            del ckpt[i]
+        print("incompatible parameters", need_del)
+        model.load_state_dict(ckpt, strict=False)
+        print("finish loading parameters")
+
+    return model
+
+
 def get_stage2_model_embeddings(config_path, dataset, checkpoint_path="last.ckpt"):
     model = loadModel(config_path, checkpoint_path)
 
@@ -956,270 +814,6 @@ def get_stage2_model_embeddings(config_path, dataset, checkpoint_path="last.ckpt
         #     model(i.x, i.edge_index, i.train_mask)
         #     model(i.x, i.edge_index, i.val_mask)
     return res
-
-
-def get_stage12_dataset(configs):
-    if configs["data"]["transform"] == "default":
-        t = getDefaultTransform()
-    elif configs["data"]["transform"] == "simple":
-        t = getSimpleTransform()
-    else:
-        t = getConstantTransform()
-
-    if "norm" not in configs["data"]:
-        configs["data"]["norm"] = "none"
-
-    if "num" not in configs["data"]:
-        configs["data"]["num"] = 5
-
-    # dataset = modules.CocoDetection(
-    #     configs["image_path"],
-    #     configs["annotation_path"],
-    #     is_npy=configs["is_npy"],
-    #     transform=t,
-    #     require_mask=configs["is_segmentation"],
-    # )  # , transform=transforms)
-    # train_set, val_set = torch.utils.data.random_split(dataset, [0.8, 0.2])
-    if isinstance(configs["data"]["annotation_path_train"], list):
-        train_sets = []
-        for i in configs["data"]["annotation_path_train"]:
-            map_class = None
-            if "map_class" in configs["data"]:
-                map_class = configs["data"]["map_class"]
-            train_sets.append(
-                modules.CocoDetection2(
-                    configs["data"]["num"],
-                    configs["data"]["image_path"],
-                    i,
-                    is_npy=configs["data"]["is_npy"],
-                    transform=t,
-                    require_mask=configs["data"]["require_mask"],
-                    filter_class=configs["data"]["filter_class"],
-                    single_class=configs["data"]["single_class"],
-                    norm=configs["data"]["norm"],
-                    map_class=map_class,
-                )
-            )
-        train_sets = torch.utils.data.ConcatDataset(train_sets)
-    else:
-        map_class = None
-        if "map_class" in configs["data"]:
-            map_class = configs["data"]["map_class"]
-        train_sets = modules.CocoDetection2(
-            configs["data"]["num"],
-            configs["data"]["image_path"],
-            configs["data"]["annotation_path_train"],
-            is_npy=configs["data"]["is_npy"],
-            transform=t,
-            require_mask=configs["data"]["require_mask"],
-            filter_class=configs["data"]["filter_class"],
-            single_class=configs["data"]["single_class"],
-            norm=configs["data"]["norm"],
-            map_class=map_class,
-        )
-
-    if isinstance(configs["data"]["annotation_path_val"], list):
-        val_sets = []
-        for i in configs["data"]["annotation_path_val"]:
-            map_class = None
-            if "map_class" in configs["data"]:
-                map_class = configs["data"]["map_class"]
-            val_sets.append(
-                modules.CocoDetection2(
-                    configs["data"]["num"],
-                    configs["data"]["image_path"],
-                    i,
-                    is_npy=configs["data"]["is_npy"],
-                    transform=getConstantTransform(),
-                    require_mask=configs["data"]["require_mask"],
-                    filter_class=configs["data"]["filter_class"],
-                    single_class=configs["data"]["single_class"],
-                    norm=configs["data"]["norm"],
-                    map_class=map_class,
-                )
-            )
-        val_sets = torch.utils.data.ConcatDataset(val_sets)
-    else:
-        val_sets = modules.CocoDetection2(
-            configs["data"]["num"],
-            configs["data"]["image_path"],
-            configs["data"]["annotation_path_val"],
-            is_npy=configs["data"]["is_npy"],
-            transform=getConstantTransform(),
-            require_mask=configs["data"]["require_mask"],
-            filter_class=configs["data"]["filter_class"],
-            single_class=configs["data"]["single_class"],
-            norm=configs["data"]["norm"],
-            map_class=map_class,
-        )
-
-    ds = modules.EMDataModule(
-        train_sets,
-        val_sets,
-        configs["training"]["train_batch_size"],
-        configs["training"]["val_batch_size"],
-        False,
-    )
-    # print("here build dataset stage 1")
-    # print(ds)
-    return ds
-
-
-def get_stage1_dataset(configs):
-    if configs["data"]["transform"] == "default":
-        t = getDefaultTransform()
-    elif configs["data"]["transform"] == "simple":
-        t = getSimpleTransform()
-    else:
-        t = getConstantTransform()
-
-    if "norm" not in configs["data"]:
-        configs["data"]["norm"] = "none"
-
-    if isinstance(configs["data"]["filter_class"], dict):
-        train_sets = {}
-        for i in configs["data"]["filter_class"]:
-            map_class = None
-            if "map_class" in configs["data"]:
-                map_class = configs["data"]["map_class"]
-            train_sets[i] = modules.CocoDetection(
-                configs["data"]["image_path"],
-                configs["data"]["annotation_path_train"],
-                is_npy=configs["data"]["is_npy"],
-                transform=t,
-                require_mask=configs["data"]["require_mask"][i],
-                filter_class=configs["data"]["filter_class"][i],
-                single_class=configs["data"]["single_class"][i],
-                norm=configs["data"]["norm"],
-                map_class=map_class,
-                mark=i,
-            )
-
-        val_sets = {}
-        for i in configs["data"]["filter_class"]:
-            map_class = None
-            if "map_class" in configs["data"]:
-                map_class = configs["data"]["map_class"]
-            val_sets[i] = modules.CocoDetection(
-                configs["data"]["image_path"],
-                configs["data"]["annotation_path_val"],
-                is_npy=configs["data"]["is_npy"],
-                transform=getConstantTransform(),
-                require_mask=configs["data"]["require_mask"][i],
-                filter_class=configs["data"]["filter_class"][i],
-                single_class=configs["data"]["single_class"][i],
-                norm=configs["data"]["norm"],
-                map_class=map_class,
-                mark=i,
-            )
-    else:
-        map_class = None
-        if "map_class" in configs["data"]:
-            map_class = configs["data"]["map_class"]
-        train_sets = modules.CocoDetection(
-            configs["data"]["image_path"],
-            configs["data"]["annotation_path_train"],
-            is_npy=configs["data"]["is_npy"],
-            transform=t,
-            require_mask=configs["data"]["require_mask"],
-            filter_class=configs["data"]["filter_class"],
-            single_class=configs["data"]["single_class"],
-            norm=configs["data"]["norm"],
-            map_class=map_class,
-        )
-        val_sets = modules.CocoDetection(
-            configs["data"]["image_path"],
-            configs["data"]["annotation_path_val"],
-            is_npy=configs["data"]["is_npy"],
-            transform=getConstantTransform(),
-            require_mask=configs["data"]["require_mask"],
-            filter_class=configs["data"]["filter_class"],
-            single_class=configs["data"]["single_class"],
-            norm=configs["data"]["norm"],
-            map_class=map_class,
-        )
-
-    # train_set, _val_set = torch.utils.data.random_split(dataset1, [0.8, 0.2])
-    # _train_set, val_set = torch.utils.data.random_split(dataset2, [0.8, 0.2])
-    # val_set.indices = _val_set.indices
-    # trainloader = DataLoader(
-    #     dataset=train_set,
-    #     collate_fn=utils.stackBatch,
-    #     batch_size=configs["training"]["train_batch_size"],
-    #     shuffle=True,
-    # )
-    # valloader = DataLoader(
-    #     dataset=val_set,
-    #     collate_fn=utils.stackBatch,
-    #     batch_size=configs["training"]["val_batch_size"],
-    # )
-    # testloader = DataLoader(dataset=val_set, collate_fn=utils.stackBatch, batch_size=1)
-
-    ds = modules.EMDataModule(
-        train_sets,
-        val_sets,
-        configs["training"]["train_batch_size"],
-        configs["training"]["val_batch_size"],
-    )
-    # print("here build dataset stage 1")
-    # print(ds)
-    return ds
-
-
-def get_stage2_dataset(configs):
-    data_list_train = []
-    for i in configs["data"]["train"]:
-        data_list_train.append(torch.load(i))
-
-    data_list_val = []
-    for i in configs["data"]["val"]:
-        data_list_val.append(torch.load(i))
-
-    if "aug" not in configs["data"]:
-        configs["data"]["aug"] = True
-
-    ds = modules.stage2DataModule(
-        data_list_train,
-        data_list_val,
-        configs["data"]["dataset_len"],
-        ifaug=configs["data"]["aug"],
-    )
-
-    return ds
-
-
-def get_stageMask_dataset(configs):
-    pixels = []
-    embeds = []
-    masks = []
-    boxes = []
-    sample_mapping = {}
-    num1 = 0
-    num2 = 0
-    for i in configs["data"]["datasets"]:
-        data = torch.load(i)
-        pixels.extend(data["pixel_values"])
-        embeds.append(data["embed"])
-        masks.append(data["masks"])
-        boxes.append(data["boxes"])
-        for j in data["sample_mapping"]:
-            sample_mapping[j + num1] = data["sample_mapping"][j] + num2
-        num1 += len(data["sample_mapping"])
-        num2 += len(data["pixel_values"])
-        # sample_mapping.update(data["sample_mapping"])
-    pixels = torch.stack(pixels, dim=0)
-    embeds = torch.cat(embeds, dim=0)
-    masks = torch.cat(masks, dim=0)
-    boxes = torch.cat(boxes, dim=0)
-    ds = modules.stage2MaskDataModule(
-        pixels,
-        embeds,
-        masks,
-        sample_mapping,
-        boxes=boxes,
-        batch_size=configs["training"]["train_batch_size"],
-    )
-    return ds
 
 
 def loadModel(path, checkpoint="last.ckpt"):
@@ -1294,9 +888,6 @@ def generateMasks(model, embed, image, pixel_mask=None, batch_size=5, device="cp
     res = res.cpu()
     model = model.cpu()
     return res
-
-
-import numpy as np
 
 
 def calculate_iou(pred_bbox, gt_bbox):
