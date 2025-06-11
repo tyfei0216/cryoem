@@ -117,34 +117,7 @@ def box_iou(boxes1, boxes2):
     return iou, union
 
 
-def generalized_box_iou(boxes1, boxes2):
-    """
-    Generalized IoU from https://giou.stanford.edu/. The boxes should be in [x0, y0, x1, y1] (corner) format.
-
-    Returns:
-        `torch.FloatTensor`: a [N, M] pairwise matrix, where N = len(boxes1) and M = len(boxes2)
-    """
-    # degenerate boxes gives inf / nan results
-    # so do an early check
-    if not (boxes1[:, 2:] >= boxes1[:, :2]).all():
-        raise ValueError(
-            f"boxes1 must be in [x0, y0, x1, y1] (corner) format, but got {boxes1}"
-        )
-    if not (boxes2[:, 2:] >= boxes2[:, :2]).all():
-        raise ValueError(
-            f"boxes2 must be in [x0, y0, x1, y1] (corner) format, but got {boxes2}"
-        )
-    iou, union = box_iou(boxes1, boxes2)
-
-    top_left = torch.min(boxes1[:, None, :2], boxes2[:, :2])
-    bottom_right = torch.max(boxes1[:, None, 2:], boxes2[:, 2:])
-
-    width_height = (bottom_right - top_left).clamp(min=0)  # [N,M,2]
-    area = width_height[:, :, 0] * width_height[:, :, 1]
-
-    return iou - (area - union) / area
-
-
+# Copied from transformers.models.detr.sigmoid_focal_loss
 def sigmoid_focal_loss(
     inputs, targets, num_boxes=None, alpha: float = 0.25, gamma: float = 2
 ):
@@ -181,37 +154,6 @@ def sigmoid_focal_loss(
         num_boxes = targets.shape[0]
 
     return loss.mean(1).sum() / num_boxes
-
-
-# def focal_loss(input, target, gamma=2):
-def loss_boxes(source_boxes, targets, num_boxes):
-    """
-    Compute the losses related to the bounding boxes, the L1 regression loss and the GIoU loss.
-
-    Targets dicts must contain the key "boxes" containing a tensor of dim [nb_target_boxes, 4]. The target boxes
-    are expected in format (center_x, center_y, w, h), normalized by the image size.
-    """
-
-    loss_bbox = nn.functional.mse_loss(source_boxes, targets, reduction="none")
-
-    # losses = {}
-    # losses["loss_bbox"] = loss_bbox.sum() / num_boxes
-
-    loss_giou = 1 - torch.diag(
-        generalized_box_iou(
-            center_to_corners_format(source_boxes),
-            center_to_corners_format(targets),
-        )
-    )
-    # print(source_boxes[0], targets[0])
-    # print(
-    #     loss_bbox,
-    #     loss_giou,
-    # )
-    loss_bbox = loss_bbox.mean()
-    loss_giou = loss_giou.mean()
-    # losses["loss_giou"] = loss_giou.sum() / num_boxes
-    return 5 * loss_bbox + 2 * loss_giou
 
 
 class DetrModel(L.LightningModule):
@@ -610,8 +552,15 @@ class DetrModel(L.LightningModule):
                     batch[0], 0, None, True
                 )
                 # print("stage 2")
-                retdict = utils.process(output, batch[0]["labels"], need_mask=True)
-                data2 = utils.convertStage2Dataset(retdict)
+                retdict = utils.process(
+                    output,
+                    batch[0]["labels"],
+                    need_mask=True,
+                    empty=self.output_dim - 1,
+                )
+                data2 = utils.convertStage2Dataset(
+                    retdict, num_classes=self.output_dim - 1
+                )
                 self.stage = "stage 2"
                 x = data2.x
                 y = data2.y
@@ -922,6 +871,21 @@ class LoRALayer(torch.nn.Module):
 
 
 class GCN(torch.nn.Module):
+    """
+    GNN module
+    This module takes in all queries and output the final GNN features
+    classification, box regression are integrated in this module, other prediction heads can be added
+
+
+    Args:
+        input_dim (int): dimension of the input features.
+        additional_input_dim (int): dimension of additional input features. (such as predictions from stage 1)
+        output_classes (int): number of output classes.
+        layer_type (str, optional): type of GNN layer to use. Defaults to "GCNConv".
+        dropout (bool, optional): whether to use dropout in GNN layers. Defaults to False.
+        zpos (int, optional): positional encoding multiplier. Defaults to 50.
+    """
+
     def __init__(
         self,
         input_dim,
@@ -1055,10 +1019,10 @@ class DoubleConv(nn.Module):
         if not mid_channels:
             mid_channels = out_channels
         self.double_conv = nn.Sequential(
-            nn.Conv2d(in_channels, mid_channels, kernel_size=3, padding=1, bias=False),
+            nn.Conv2d(in_channels, mid_channels, kernel_size=3, padding=1),
             nn.GroupNorm(1, mid_channels),
             nn.GELU(),
-            nn.Conv2d(mid_channels, out_channels, kernel_size=3, padding=1, bias=False),
+            nn.Conv2d(mid_channels, out_channels, kernel_size=3, padding=1),
             nn.GroupNorm(1, out_channels),
         )
 

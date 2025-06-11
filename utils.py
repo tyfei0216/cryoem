@@ -2,13 +2,14 @@ import json
 import os
 from typing import List
 
-import mrcfile
 import numpy as np
 import pandas as pd
 import pytorch_lightning as L
 import torch
 import torch.nn as nn
+import torchvision
 import torchvision.transforms.v2 as transforms
+from sklearn.cluster import DBSCAN
 from sklearn.neighbors import NearestNeighbors
 from torch_geometric.data import Data
 from torchvision.tv_tensors import BoundingBoxes, Mask
@@ -368,7 +369,6 @@ def processSingle(model, label, data, target_size, thres, has_none, empty=5):
         "item_id": item_ids,
         "masks": masks,
     }
-    return ret, l, box_masks, boxeses
 
 
 def buildStage2(
@@ -530,11 +530,23 @@ def get_iou(X):
     return iou
 
 
-def get_neighbors(X, z_thres1=0.03, z_thres2=0.5, iou_thres=0.4):
+def get_neighbors(
+    X, z_thres1=0.03, z_thres2=0.5, iou_thres=0.4, num_classes=5, obj_thres=0.2
+):
     X2 = X[:, 1:5].clone()
-    X2[:, 3:] += 0.05
+    # expand a little so that boxes may overlap
+    X2[:, 2:] += 0.05
+
     iou, _ = modules.box_iou(center_to_corners_format(X2), center_to_corners_format(X2))
     x, y = torch.where(iou > 0.01)
+
+    obj = X[:, 5 : 5 + num_classes] > obj_thres
+    obj = obj.any(dim=1)
+
+    iou -= 1 - obj.float()
+    iou = iou.T
+    iou -= 1 - obj.float()
+
     zposx = X[:, 0][x]
     zposy = X[:, 0][y]
     x = x[torch.abs(zposx - zposy) < z_thres1]
@@ -584,12 +596,19 @@ def get_neighbors(X, z_thres1=0.03, z_thres2=0.5, iou_thres=0.4):
     # return xs, ys
 
 
-def convertStage2Dataset(retdict, z_thres1=0.01, z_thres2=0.2, iou_thres=0.4):
+def convertStage2Dataset(
+    retdict, z_thres1=0.01, z_thres2=0.1, iou_thres=0.4, num_classes=5, obj_thres=0.2
+):
     X = retdict["feature"]
 
     # print("building up neighboring graph")
     xs, ys = get_neighbors(
-        X.clone().detach(), z_thres1=z_thres1, z_thres2=z_thres2, iou_thres=iou_thres
+        X.clone().detach(),
+        z_thres1=z_thres1,
+        z_thres2=z_thres2,
+        iou_thres=iou_thres,
+        obj_thres=obj_thres,
+        num_classes=num_classes,
     )
     # print(xs, ys, len(xs), len(ys))
 
@@ -962,3 +981,130 @@ def calculate_ap(pred_bboxes, gt_bboxes, iou_thresholds=[0.5, 0.75]):
         aps[f"AP@{iou_threshold*100}"] = ap
 
     return aps
+
+
+def get_target_df(graph):
+    z = graph.x[:, [0]]
+    boxes = graph.boxes
+    labels = graph.y.unsqueeze(1)
+    df = torch.cat([z, boxes, labels], dim=1)
+
+    target_df = pd.DataFrame(df.numpy(), columns=["z", "x", "y", "w", "h", "label"])
+    target_df["z"] = target_df["z"] * 500
+    target_df["z"] = target_df["z"].astype(int)
+    target_df["label"] = target_df["label"].astype(int)
+    target_df = target_df[target_df["label"] != 5]
+    target_df["name"] = target_df["label"].map(
+        {
+            0: "ribo",
+            1: "microtubule",
+            2: "nucleus",
+            3: "endoplasmic_reticulum_or_Golgi",
+            4: "mitochondria",
+        }
+    )
+
+    bboxes = target_df[["x", "y", "w", "h"]].values
+    bboxes = convertBoxes(torch.tensor(bboxes))
+    bboxes = torch.tensor(bboxes) * torch.tensor([800, 800, 800, 800])
+    target_df[["x1", "y1", "x2", "y2"]] = bboxes.numpy()
+    target_df["mask_id"] = range(len(target_df))
+    return target_df
+
+
+def get_result_df(model, graph):
+    model.stage = "stage 2"
+    model.eval()
+    with torch.no_grad():
+        res = model(graph.x, graph.edge_index)
+    z = graph.x[:, [0]]
+    prob = torch.softmax(res["predict"], 1)
+    pred_boxes = res["box"]
+    df = torch.cat([z, pred_boxes, prob], 1)
+    df = df.detach().numpy()
+    df = pd.DataFrame(
+        df,
+        columns=[
+            "z",
+            "x",
+            "y",
+            "w",
+            "h",
+            "ribo",
+            "microtubule",
+            "nucleus",
+            "endoplasmic_reticulum_or_Golgi",
+            "mitochondria",
+            "None",
+        ],
+    )
+    df["z"] = df["z"] * 500
+    df["z"] = df["z"].astype(int)
+    bboxes = df[["x", "y", "w", "h"]].values
+    bboxes = convertBoxes(torch.tensor(bboxes))
+    bboxes = torch.tensor(bboxes) * torch.tensor([800, 800, 800, 800])
+    df[["x1", "y1", "x2", "y2"]] = bboxes.numpy()
+    subdf = df[
+        [
+            "ribo",
+            "microtubule",
+            "nucleus",
+            "endoplasmic_reticulum_or_Golgi",
+            "mitochondria",
+        ]
+    ]
+    df["max"] = subdf.max(axis=1)
+    df["largest"] = subdf.idxmax(axis=1)
+    return df
+
+
+def post_process_df(
+    df, thres=0.5, nms=0.5, min_sample=3, eps=0.4, dis_penalty=0.01 * 0.05
+):
+    df = df[df["max"] > thres]
+    dfs = []
+    for i, subdf in df.groupby("z"):
+        keep = bbnms(
+            nms,
+            subdf[["x1", "y1", "x2", "y2"]].values,
+            subdf["max"].values,
+            subdf["largest"].values,
+        )
+        dfs.append(subdf.iloc[keep.numpy()])
+
+    df = pd.concat(dfs, ignore_index=True)
+
+    dbscan = DBSCAN(min_samples=min_sample, eps=eps, metric="precomputed")
+    iou = get_iou(df[["x", "y", "w", "h"]].values)
+    iou = 1 - iou
+    mask = df["z"].values
+    mask = mask[:, None] == mask[None, :]
+    iou[mask] = 2
+    mask = df["z"].values
+    z_penalty = (np.abs(mask[:, None] - mask[None, :]) ** 2) * dis_penalty
+    iou = iou + z_penalty
+    dbscan.fit(iou)
+    df["label"] = list(dbscan.labels_)
+
+    return df
+
+
+def cal_ap(df, target_df, iou_thresholds=[0.5, 0.75]):
+    pres = []
+    gts = []
+    slices = list(target_df["z"])
+    slices.extend(list(df["z"]))
+    slices = np.unique(slices)
+    for j in slices:
+        s1 = []
+        s2 = []
+        sub1 = target_df[target_df["z"] == j]
+        sub2 = df[df["z"] == j]
+        for i, r in sub1.iterrows():
+            s1.append(np.array([r["x1"], r["y1"], r["x2"], r["y2"]]))
+        for i, r in sub2.iterrows():
+            s2.append(np.array([r["x1"], r["y1"], r["x2"], r["y2"]]))
+        pres.append(s2)
+        gts.append(s1)
+
+    return calculate_ap(pres, gts, iou_thresholds=iou_thresholds)
