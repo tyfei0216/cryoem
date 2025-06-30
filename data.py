@@ -431,7 +431,9 @@ class CocoDetection(torchvision.datasets.vision.VisionDataset):
 
         if seed is not None:
             with self.lock:
-                L.seed_everything(seed, verbose=False)
+                random.seed(seed)
+                np.random.seed(seed)
+                torch.manual_seed(seed)
                 if self.transform is not None:
                     image, target = self.transform(image, target)
         else:

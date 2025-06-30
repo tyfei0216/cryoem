@@ -893,7 +893,7 @@ class GCN(torch.nn.Module):
         output_classes,
         layer_type="GCNConv",
         dropout=False,
-        zpos=50,
+        zpos=100,
     ):
 
         super().__init__()
@@ -959,9 +959,9 @@ class GCN(torch.nn.Module):
 
     def inipos(self, channels):
         inv_freq = 1.0 / (
-            (55 * 10) ** (torch.arange(0, channels, 2).float() / channels)
+            (100 * 10) ** (torch.arange(0, channels, 2).float() / channels)
         )  # .to(self.device)
-        t = torch.arange(0, 55)[:, None]  # .to(self.device)
+        t = torch.arange(0, 105)[:, None]  # .to(self.device)
         # print(t.shape, inv_freq.shape)
         pos_enc_a = torch.sin(t.repeat(1, channels // 2) * inv_freq)
         pos_enc_b = torch.cos(t.repeat(1, channels // 2) * inv_freq)

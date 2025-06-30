@@ -2,6 +2,7 @@ import json
 import os
 from typing import List
 
+import mrcfile
 import numpy as np
 import pandas as pd
 import pytorch_lightning as L
@@ -58,7 +59,7 @@ def drawannotation(image, target, box=True, mask=True, font_size=30):
             image=image,
             masks=target["masks"],
             alpha=0.5,
-            colors=[int_colors[i] for i in target["class_labels"]],
+            # colors=[int_colors[i] for i in target["class_labels"]],
         )
     else:
         annotated_tensor = image
@@ -1108,3 +1109,8 @@ def cal_ap(df, target_df, iou_thresholds=[0.5, 0.75]):
         gts.append(s1)
 
     return calculate_ap(pres, gts, iou_thresholds=iou_thresholds)
+
+
+def readTomogram(filename):
+    with mrcfile.open(filename, permissive=True) as m:
+        return m.data
